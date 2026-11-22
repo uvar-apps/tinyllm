@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ref/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+# local benchmark and oracle output; curated results live in bench/baselines and tests/golden
+/out/

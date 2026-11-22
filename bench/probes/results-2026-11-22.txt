@@ -1,0 +1,73 @@
+# Raw probe output, 2026-11-22, Qwen3.8-27B UD-Q4_K_XL, tinygrad cdabdcb, DEV=KFD+AMD, ctx 4096
+#
+# CORRECTION (phase 0): every per-call time above 200 ms in this file is inflated. batch_probe.py waits
+# with Device.synchronize(), and tinygrad's default wait on this machine rounds a step longer than 200 ms
+# up to the next ~208 ms tick (415.6, 623.7, 831.7 ...). Times below 200 ms, including all decode steps
+# up to 8 rows, are accurate. Correct prefill numbers are in bench/baselines/, measured by `tinyllm bench`.
+# batch_probe.py B model chunk steps
+### batch 1 chunk 32
+B=1 load 17.0s
+B=1 prefill chunk=32: first3=[18.78, 9.76, 0.17]s  warm median 170.3 ms/chunk -> 187.9 tok/s aggregate (187.9 per stream)
+B=1 decode: first4=[11.03, 5.93, 0.18, 0.08]s  warm median 79.80 ms/step -> 12.53 tok/s aggregate (12.53 per stream), 215 GB/s, rows_equal=True tok=320
+### batch 4 chunk 32
+B=4 load 17.5s
+B=4 prefill chunk=32: first3=[24.55, 12.92, 0.42]s  warm median 415.7 ms/chunk -> 307.9 tok/s aggregate (77.0 per stream)
+B=4 decode: first4=[13.47, 7.04, 0.19, 0.09]s  warm median 90.19 ms/step -> 44.35 tok/s aggregate (11.09 per stream), 212 GB/s, rows_equal=True tok=320
+### batch 8 chunk 32
+B=8 load 16.7s
+B=8 prefill chunk=32: first3=[25.12, 13.2, 0.83]s  warm median 831.7 ms/chunk -> 307.8 tok/s aggregate (38.5 per stream)
+B=8 decode: first4=[15.17, 8.56, 0.21, 0.11]s  warm median 105.93 ms/step -> 75.52 tok/s aggregate (9.44 per stream), 205 GB/s, rows_equal=True tok=320
+### batch 1 chunk 8
+B=1 load 17.5s
+B=1 prefill chunk=8: first3=[18.18, 9.74, 0.11]s  warm median 107.6 ms/chunk -> 74.4 tok/s aggregate (74.4 per stream)
+B=1 decode: first4=[10.99, 5.97, 0.18, 0.08]s  warm median 79.41 ms/step -> 12.59 tok/s aggregate (12.59 per stream), 216 GB/s, rows_equal=True tok=20
+### batch 2 chunk 32
+B=2 load 16.7s
+B=2 prefill chunk=32: first3=[22.79, 11.65, 0.41]s  warm median 415.6 ms/chunk -> 154.0 tok/s aggregate (77.0 per stream)
+B=2 decode: first4=[12.38, 6.36, 0.18, 0.08]s  warm median 83.28 ms/step -> 24.02 tok/s aggregate (12.01 per stream), 214 GB/s, rows_equal=True tok=320
+### batch 16 chunk 32
+B=16 load 16.7s
+B=16 prefill chunk=32: first3=[25.97, 14.16, 1.66]s  warm median 1871.7 ms/chunk -> 273.5 tok/s aggregate (17.1 per stream)
+B=16 decode: first4=[14.99, 8.33, 0.3, 0.18]s  warm median 178.58 ms/step -> 89.59 tok/s aggregate (5.60 per stream), 133 GB/s, rows_equal=True tok=320
+### batch 1 chunk 16
+B=1 load 16.9s
+B=1 prefill chunk=16: first3=[18.09, 8.89, 0.16]s  warm median 157.9 ms/chunk -> 101.3 tok/s aggregate (101.3 per stream)
+B=1 decode: first4=[11.37, 5.84, 0.18, 0.08]s  warm median 79.52 ms/step -> 12.58 tok/s aggregate (12.58 per stream), 215 GB/s, rows_equal=True tok=320
+### batch 1 chunk 128
+B=1 load 16.8s
+B=1 prefill chunk=128: first3=[24.23, 12.83, 0.62]s  warm median 623.7 ms/chunk -> 205.2 tok/s aggregate (205.2 per stream)
+B=1 decode: first4=[11.29, 5.97, 0.18, 0.08]s  warm median 80.73 ms/step -> 12.39 tok/s aggregate (12.39 per stream), 213 GB/s, rows_equal=True tok=1048
+### batch 1 chunk 64
+B=1 load 16.6s
+B=1 prefill chunk=64: first3=[22.1, 12.13, 0.42]s  warm median 415.5 ms/chunk -> 154.0 tok/s aggregate (154.0 per stream)
+B=1 decode: first4=[11.3, 5.81, 0.18, 0.08]s  warm median 80.10 ms/step -> 12.48 tok/s aggregate (12.48 per stream), 214 GB/s, rows_equal=True tok=29
+
+# tinygrad extra/benchmark_llm.py --prompt-tokens 1024 --decode-tokens 32
+load 18.013s
+warm 45.236s
+prefill 198.337 tok/s
+decode 11.773 tok/s output [1023, 1024, 1025, 1737, 1027, 1028, 1029, 1030, 1031
+
+# python -m tinygrad.llm --benchmark 512,48 (first run, includes JIT warm-up in prefill and decode 0-2)
+loaded model "Qwen3.8-27B" at 1.00 GB/s with 17,197,172,736 bytes and 26,895,998,464 params, max context 4096 
+prefill   512: 30709.98 ms,    16.67 tok/s,   10.46 GB/s, 321101/17833 MB  --  5
+decode      0: 11328.49 ms,     0.09 tok/s,    1.52 GB/s, 17164/17863 MB  --  5 
+decode      1: 5796.46 ms,     0.17 tok/s,    2.96 GB/s, 17164/17871 MB  --  5 1
+decode      2: 182.92 ms,     5.47 tok/s,   93.83 GB/s, 17164/17879 MB  --  5 15
+decode      3:  80.31 ms,    12.45 tok/s,  213.72 GB/s, 17164/17879 MB  --  5 156
+decode      4:  80.30 ms,    12.45 tok/s,  213.74 GB/s, 17164/17879 MB  --  5 156 
+decode      5:  80.19 ms,    12.47 tok/s,  214.05 GB/s, 17164/17879 MB  --  5 156 1
+decode      6:  80.29 ms,    12.46 tok/s,  213.78 GB/s, 17164/17879 MB  --  5 156 15
+decode      7:  80.22 ms,    12.47 tok/s,  213.96 GB/s, 17164/17879 MB  --  5 156 157
+decode      8:  80.25 ms,    12.46 tok/s,  213.89 GB/s, 17164/17879 MB  --  5 156 157 
+decode      9:  80.27 ms,    12.46 tok/s,  213.83 GB/s, 17164/17879 MB  --  5 156 157 1
+decode     10:  80.31 ms,    12.45 tok/s,  213.72 GB/s, 17164/17879 MB  --  5 156 157 15
+decode     11:  80.27 ms,    12.46 tok/s,  213.82 GB/s, 17164/17879 MB  --  5 156 157 158
+decode     12:  80.26 ms,    12.46 tok/s,  213.86 GB/s, 17164/17879 MB  --  5 156 157 158 
+decode     13:  80.31 ms,    12.45 tok/s,  213.71 GB/s, 17164/17879 MB  --  5 156 157 158 1
+decode     14:  80.26 ms,    12.46 tok/s,  213.87 GB/s, 17164/17879 MB  --  5 156 157 158 15
+decode     15:  80.30 ms,    12.45 tok/s,  213.75 GB/s, 17164/17879 MB  --  5 156 157 158 159
+decode     16:  80.28 ms,    12.46 tok/s,  213.79 GB/s, 17164/17879 MB  --  5 156 157 158 159 
+decode     17:  80.25 ms,    12.46 tok/s,  213.88 GB/s, 17164/17879 MB  --  5 156 157 158 159 1
+decode     18:  80.29 ms,    12.46 tok/s,  213.78 GB/s, 17164/17879 MB  --  5 156 157 158 159 16
+decode     19:  80.27 ms,    12.46 tok/s,  213.83 GB/s, 17164/17879 MB  --  5 156 157 158 159 160

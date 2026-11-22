@@ -1,0 +1,64 @@
+[project]
+name = "tinyllm"
+version = "0.0.1"
+description = "OpenAI-compatible LLM serving on tinygrad for quantized GGUF models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "tinygrad",
+  "numpy>=2.1",
+]
+
+[project.scripts]
+tinyllm = "tinyllm.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.9",
+  "mypy>=1.14",
+]
+
+# tinygrad is pinned to an exact commit: tinygrad/llm changes daily and its custom
+# kernel API is marked alpha. Bump this together with tinyllm.pin.TINYGRAD_REV and
+# rerun the oracle and benchmark suites (docs/02-design.md, decision D2).
+[tool.uv.sources]
+tinygrad = { git = "https://github.com/tinygrad/tinygrad.git", rev = "cdabdcba0747eae78b136cb79db1e12492441eda" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tinyllm"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["bench/probes", ".ref"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/tinyllm"]
+strict = true
+warn_unused_ignores = true
+# tinygrad ships type hints, but checking our code against its internals is noisy and
+# slow; everything that touches it lives in tinyllm.tg and is checked at that boundary.
+[[tool.mypy.overrides]]
+module = ["tinygrad", "tinygrad.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+# GPU tests are opt-in: `pytest -m gpu`
+addopts = "-q --strict-markers -m 'not gpu'"
+markers = [
+  "model: needs the Qwen3.5-0.8B development model (tools/fetch_dev_models.sh)",
+  "gpu: needs a supported AMD GPU; never run in CI",
+  "reference: needs the reference llama.cpp build (tools/build_ref_llamacpp.sh)",
+]
