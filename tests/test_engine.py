@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 
 import pytest
-from fakes import CountingRunner, DeviceCountingRunner
+from fakes import CountingRunner, DeviceCountingRunner, SpecCountingRunner
 
 from tinyllm.engine.core import Engine, EngineRequest, Event, FinishEvent, TokenEvent
 from tinyllm.engine.sampling import SamplingParams
@@ -176,3 +176,54 @@ def test_device_logprobs_match_the_host_path() -> None:
         assert isinstance(d, TokenEvent) and isinstance(h, TokenEvent) and d.token == h.token
         assert d.sample.logprob == pytest.approx(h.sample.logprob, abs=1e-4)
         assert [t for t, _ in d.sample.top] == [t for t, _ in h.sample.top]
+
+
+def _tokens(events: list[Event]) -> list[int]:
+    return [e.token for e in events if isinstance(e, TokenEvent)]
+
+
+def test_speculative_cycles_give_the_plain_output() -> None:
+    plain, _ = _run_one(Engine(DeviceCountingRunner()), EngineRequest("a", [1, 2], GREEDY, max_tokens=12))
+    runner = SpecCountingRunner(speculative=3)
+    events, done = _run_one(Engine(runner), EngineRequest("b", [1, 2], GREEDY, max_tokens=12))
+    assert _tokens(events) == _tokens(plain) and done.reason == "length" and done.completion_tokens == 12
+    assert runner.cycles[0] == 3 and runner.sampled_calls == 0  # every draft holds: 4 tokens per cycle
+    # rejected drafts cost tokens per cycle, never correctness
+    runner = SpecCountingRunner(speculative=3, wrong=frozenset({4, 9, 10}))
+    events, _ = _run_one(Engine(runner), EngineRequest("c", [1, 2], GREEDY, max_tokens=12))
+    assert _tokens(events) == _tokens(plain) and min(runner.cycles) < 3
+    assert runner.tokens[:2] == [1, 2] and runner.tokens[2:] == _tokens(events)[: len(runner.tokens) - 2]
+
+
+def test_speculative_stops_inside_a_cycle() -> None:
+    runner = SpecCountingRunner(speculative=3)
+    request = EngineRequest("a", [1, 2], GREEDY, max_tokens=50, end_tokens=frozenset({6}))
+    events, done = _run_one(Engine(runner), request)
+    assert _tokens(events) == [3, 4, 5] and done.reason == "stop"
+    events, done = _run_one(Engine(SpecCountingRunner(speculative=3)), EngineRequest("b", [1, 2], GREEDY, max_tokens=6))
+    assert _tokens(events) == [3, 4, 5, 6, 7, 8] and done.reason == "length" and done.completion_tokens == 6
+
+
+def test_speculative_seeded_sampling_matches_plain_decoding() -> None:
+    params = SamplingParams(temperature=40.0, top_k=6, seed=11)  # flat enough that the draws vary
+    plain, _ = _run_one(Engine(DeviceCountingRunner()), EngineRequest("a", [1, 2], params, max_tokens=40))
+    runner = SpecCountingRunner(speculative=3)
+    spec, _ = _run_one(Engine(runner), EngineRequest("b", [1, 2], params, max_tokens=40))
+    assert _tokens(spec) == _tokens(plain)
+    assert len(set(_tokens(plain))) > 5 and 0 in runner.cycles  # draws differ from the drafts and get rejected
+
+
+def test_speculative_off_near_the_context_limit_and_when_disabled() -> None:
+    runner = SpecCountingRunner(speculative=3, max_context=10)
+    events, done = _run_one(Engine(runner), EngineRequest("a", [1, 2], GREEDY, max_tokens=20))
+    assert _tokens(events) == list(range(3, 3 + len(_tokens(events)))) and done.reason == "length"
+    assert runner.sampled_calls > 0  # the last positions decode one token at a time
+    runner = SpecCountingRunner(speculative=3)
+    _run_one(Engine(runner, speculative=False), EngineRequest("b", [1, 2], GREEDY, max_tokens=5))
+    assert not runner.cycles and runner.sampled_calls == 4
+
+
+def test_prompt_slices_carry_the_next_prompt_token() -> None:
+    runner = CountingRunner()
+    _run_one(Engine(runner, prefill_slice=4), EngineRequest("a", list(range(10)), GREEDY, max_tokens=2))
+    assert runner.followings[:3] == [4, 8, None]

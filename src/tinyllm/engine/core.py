@@ -78,10 +78,17 @@ class _Active:
 
 class Engine:
     def __init__(
-        self, runner: Runner, max_waiting: int = 16, prefill_slice: int = 512, device_sampling: bool = True
+        self,
+        runner: Runner,
+        max_waiting: int = 16,
+        prefill_slice: int = 512,
+        device_sampling: bool = True,
+        speculative: bool = True,
     ) -> None:
         self.runner = runner
         self.device_sampling = device_sampling  # sample on the device when the runner can and the settings allow
+        # draft-and-verify cycles (tinyllm.tg.speculative) for device-sampled requests, when the runner has them
+        self.speculative = int(getattr(runner, "speculative", 0)) if speculative else 0
         self.max_waiting = max_waiting
         self.prefill_slice = prefill_slice  # prompt tokens per engine step; a multiple of the runner's chunk
         self.metrics = Metrics()
@@ -187,7 +194,8 @@ class Engine:
             if a.fed < len(r.prompt):
                 start = time.monotonic()
                 piece = r.prompt[a.fed : a.fed + self.prefill_slice]
-                logits = self.runner.feed(piece)
+                end = a.fed + len(piece)
+                logits = self.runner.feed(piece, r.prompt[end] if end < len(r.prompt) else None)
                 a.fed += len(piece)
                 a.prefill_seconds += time.monotonic() - start
                 if a.fed < len(r.prompt):
@@ -196,6 +204,18 @@ class Engine:
                 assert a.last is not None
                 if a.fed + 1 >= self.runner.max_context:
                     self._finish(a, "length")
+                    return
+                k = self.speculative
+                if a.device and k and a.fed + k + 1 < self.runner.max_context:
+                    # one draft-and-verify cycle: the last token and the drafts the main model agreed with go in,
+                    # and the main model's own tokens at those rows come out (n accepted drafts and one more)
+                    rows, n = self.runner.feed_speculative(a.last, a.sampler.device_rows(k + 1))
+                    a.fed += n + 1
+                    self.metrics.record_cycle(k, n)
+                    for j in range(n + 1):
+                        self._emit(a, a.sampler.from_device(rows[j]))
+                        if self._active is not a:  # finished: an end token, max_tokens or the context
+                            break
                     return
                 a.fed += 1
                 if a.device:  # sampled inside the decode program: a few candidates come back, not the logits

@@ -3,8 +3,9 @@
 An OpenAI-compatible LLM server for quantized GGUF models, built on [tinygrad](https://github.com/tinygrad/tinygrad).
 First target: the Qwen3.8 family on AMD Strix Halo (`gfx1151`) under Linux.
 
-Status: **phase 1** (single-stream server). `tinyllm serve` answers OpenAI's chat and completions APIs, with
-streaming, reasoning, tool calls, stop strings, seeds and logprobs, one request at a time. Below it sit the tools
+Status: **phase 1** (single-stream server) and **MTP speculative decoding** from phase 3. `tinyllm serve` answers
+OpenAI's chat and completions APIs, with streaming, reasoning, tool calls, stop strings, seeds and logprobs, one
+request at a time, drafting with the model's own multi-token-prediction block where the GGUF has one. Below it sit the tools
 every phase is measured against: model inspection, a benchmark harness with recorded baselines, and an oracle
 harness that checks outputs against tinygrad's own engine and against llama.cpp.
 
@@ -69,7 +70,16 @@ print(reply.choices[0].message.content)
   decoding, and top-k up to 32 with temperature, top-p and min-p (Qwen3.8's defaults), sample inside the decode
   program on the GPU; penalties, logit bias and other top-k values sample on the host, at about 12 tok/s.
 
-`tools/openai_sdk_check.py --base-url ...` runs the phase 1 checks against a running server.
+- Speculative decoding (`--speculative K`, default 3 when the GGUF has an MTP block, 0 turns it off): each step
+  drafts K tokens with Qwen3.8's built-in MTP block and verifies them in one pass of the main model, which samples
+  every position itself. Output is the same as without speculation, token for token, greedy or seeded: the verify
+  computes bit for bit what one-token decoding computes (`tools/rollback_check.py`). Drafts use a Q4_0 copy of the
+  output head made at load (`TINYLLM_DRAFT_HEAD=output` uses the model's own; `q4:98304` keeps only the first
+  98,304 tokens, faster for English and code, poor for other languages). Requests that sample on the host decode
+  one token at a time. `/metrics` counts drafts and accepted drafts.
+
+`tools/openai_sdk_check.py --base-url ...` runs the phase 1 checks against a running server; `tools/spec_check.py`
+compares speculative and plain decoding on a model.
 
 ## Commands
 

@@ -16,6 +16,7 @@ token the filters could keep.
 
 from __future__ import annotations
 
+import secrets
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -92,11 +93,15 @@ class Sampler:
         self.rng = np.random.default_rng(params.seed)
         self.seen = set(prompt)  # prompt and generated tokens, for the repetition penalty
         self.generated: Counter[int] = Counter()
+        self.count = 0  # tokens generated so far
+        # the device sampler's uniform numbers come from (stream, position), not from a running generator
+        self.stream = int(params.seed) if params.seed is not None else secrets.randbits(63)
 
     def accept(self, token: int) -> None:
         """Record a token added to the sequence (sampled here, or decided elsewhere)."""
         self.seen.add(token)
         self.generated[token] += 1
+        self.count += 1
 
     def sample(self, logits: np.ndarray) -> Sample:
         """Pick the next token from one row of logits (shape (vocab,)) and record it."""
@@ -109,12 +114,21 @@ class Sampler:
         return result
 
     def device_params(self) -> list[float]:
-        """What the device sampler needs for the next token: temperature, top_k, top_p, min_p and a uniform number
-        from this request's generator (drawn once per token, as the host path draws one)."""
+        """What the device sampler needs for the next token: temperature, top_k, top_p, min_p and a uniform
+        number (see `device_rows`)."""
+        return self.device_rows(1)[0]
+
+    def device_rows(self, count: int) -> list[list[float]]:
+        """Device sampler settings for the next `count` generated positions.
+
+        Each position's uniform number depends only on the request's stream (its seed) and the position, so a
+        speculative cycle, which samples several positions at once and may discard some, draws the same token at
+        each position as one-token decoding does."""
         p = self.params
         if p.greedy:
-            return [0.0, 1.0, 1.0, 0.0, 0.0]
-        return [p.temperature, float(p.top_k), p.top_p, p.min_p, float(self.rng.random())]
+            return [[0.0, 1.0, 1.0, 0.0, 0.0] for _ in range(count)]
+        head = [p.temperature, float(p.top_k), p.top_p, p.min_p]
+        return [[*head, float(np.random.default_rng([self.stream, self.count + j]).random())] for j in range(count)]
 
     def from_device(self, out: np.ndarray) -> Sample:
         """The Sample a device sampler chose; records it. `out`: token, log-sum-exp, candidate logits, their ids."""

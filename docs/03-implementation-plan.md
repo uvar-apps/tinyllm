@@ -238,6 +238,23 @@ Exit criteria
 - One stream reaches at least 25 tok/s on code and JSON prompts (2× baseline, llama.cpp's published level); stretch goal 35 tok/s with DFlash2.
 - No throughput regression with four or more streams.
 
+**Status, 2026-11-23: 3c (MTP) built ahead of phase 2**, on the phase 1 engine (`tinyllm.tg.mtp`,
+`tinyllm.tg.speculative`, `tinyllm.tg.kernels.deltanet`; research findings, section 5.7). Item 3a's machinery is
+in place for one stream: verify programs with logits and sampling at every row, the main model's hidden states for
+the drafter, and DeltaNet rollback by per-row state snapshots rather than replay (design 4.10). Acceptance is
+sample-and-match against greedy drafts, which accepts as often as rejection sampling would for a deterministic
+draft, and gives the same tokens as plain decoding.
+
+- Met: greedy output token-identical with speculation on and off (`tools/spec_check.py`), and more: the verify
+  computes what one-token decoding computes bit for bit (`tools/rollback_check.py`, a GPU test), so seeded sampling
+  matches too. Checked on `UD-Q4_K_XL` and `UD-Q8_K_XL`.
+- Met: at least 25 tok/s on code with `UD-Q4_K_XL` (34.9 with K = 3). Over five prompts of different kinds:
+  27.6 tok/s greedy and 25.0 seeded, against 12.5 without speculation; `UD-Q8_K_XL` goes from 7.4 to 18.7.
+- Served by default (`tinyllm serve --speculative K`, 3 when the GGUF has an MTP block): the SDK checks pass, and
+  a 30-minute soak ran 878 requests without a failure or memory growth.
+- Not yet: 3b (n-gram), 3d (DFlash2), adaptive draft length (per-prompt best K would add about 5%), and the
+  multi-stream criterion, which needs phase 2.
+
 ## Phase 4 — Strix Halo optimisation and quantization coverage
 
 Purpose: the advanced-execution work for 8, 6 and 4-bit weights and BF16 (design 4.7), driven by profiles.
@@ -302,8 +319,12 @@ Exit criteria: the same oracle and API test suites pass on each platform, with a
    instruction-level code through tinygrad's AMD assembler backend: a large project, worth up to about 1.6 times on
    these calls.
 2. ~~Warm-up for both prefill programs.~~ Done in phase 1 (`UpstreamRunner.warmup`, run by `tinyllm serve`).
-3. Start-up: compiling the 27B's programs takes 94 seconds; pickled programs with the weights bound from the GGUF at
-   load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
+3. Speculative decoding (phase 3, MTP done): an adaptive draft length. The best K is 5 for code and 2 for prose
+   (research findings, section 5.7); choosing it per prompt would add about 5% over the test prompts against a
+   fixed K of 3. Needs a cycle program per K (about 15 s of compiling each) or one program that skips the MTP steps
+   past a low-confidence draft.
+4. Start-up: compiling the 27B's programs takes 94 seconds (about 140 with the speculative cycle); pickled programs
+   with the weights bound from the GGUF at load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
    the chunk compiles the variable-length program on first use; the phase 1 server should compile both at start.
 
 ## Decisions wanted from you

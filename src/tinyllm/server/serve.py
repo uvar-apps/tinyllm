@@ -7,6 +7,7 @@ import logging
 import signal
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("tinyllm.serve")
@@ -21,6 +22,17 @@ SAMPLING_KEYS = {
 
 def sampling_defaults(kv: dict[str, Any]) -> dict[str, float]:
     return {name: float(kv[key]) for key, name in SAMPLING_KEYS.items() if key in kv}
+
+
+DEFAULT_DRAFTS = 3  # MTP drafts per speculative cycle (docs/01-research-findings.md, section 5.7)
+
+
+def has_mtp(path: Path) -> bool:
+    """Whether the GGUF carries one MTP (nextn) block, which speculative decoding drafts with."""
+    from tinyllm.weights import gguf
+
+    kv = gguf.read(path, header_only=True).kv
+    return int(kv.get(f"{kv.get('general.architecture')}.nextn_predict_layers", 0) or 0) == 1
 
 
 def main(args: argparse.Namespace) -> int:
@@ -40,12 +52,14 @@ def main(args: argparse.Namespace) -> int:
 
     path = find_model(args.model)
     start = time.perf_counter()
-    runner = UpstreamRunner(path, args.ctx, chunk=args.chunk)
+    k = args.speculative if args.speculative is not None else DEFAULT_DRAFTS if has_mtp(path) else 0
+    runner = UpstreamRunner(path, args.ctx, chunk=args.chunk, speculative=k)
     tokenizer = GGUFTokenizer(runner.kv)
     template = None
     if tokenizer.chat_template and not args.no_chat_template:
         template = ChatTemplate(tokenizer.chat_template, tokenizer.bos_token, tokenizer.eos_token)
-    log.info("loaded %s in %.1fs; compiling", path.name, time.perf_counter() - start)
+    drafting = f", {runner.speculative} MTP drafts per step" if runner.speculative else ""
+    log.info("loaded %s in %.1fs%s; compiling", path.name, time.perf_counter() - start, drafting)
     runner.warmup()
     log.info("compiled in %.1fs", runner.warmup_seconds)
 
@@ -86,4 +100,12 @@ def add_parser(sub: Any) -> None:
     )
     sp.add_argument("--queue-timeout", type=float, default=None, help="seconds a request may wait before it starts")
     sp.add_argument("--no-chat-template", action="store_true", help="serve /v1/completions only")
+    sp.add_argument(
+        "--speculative",
+        type=int,
+        default=None,
+        metavar="K",
+        help=f"MTP drafts per decode step, 0 to turn speculative decoding off "
+        f"(default: {DEFAULT_DRAFTS} when the model has an MTP block)",
+    )
     sp.set_defaults(fn=main)

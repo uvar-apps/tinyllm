@@ -391,6 +391,64 @@ Phase 1 exit checks on `UD-Q4_K_XL` through the OpenAI Python SDK (`tools/openai
 
 The first version gained nothing (11.80 tok/s): its three copies per step (the token and the settings in, the result out) each cost 0.55 to 0.63 ms of host time in tinygrad's executor, while replaying the whole decode program cost 0.14 ms. Input and output now live in GPU memory mapped into the process (`BufferSpec(cpu_access=True)`), which the host writes and reads in place. A sampled decode step then takes 79.6 to 80.1 ms over 400 steps, 12.5 tok/s, as fast as tinygrad's own sample-mode loop, and the CPU stays at 5.1 GHz. End to end through the server: 12.52 tok/s, steady at 12.4 to 12.5 through every request of the check run. Requests with penalties, logit bias, no top-k or a top-k above 32 keep the host sampler. The cost is start-up: compiling the second decode program takes the 27B's from 79 to 94 seconds. A first version of the top-k kernel sorted blocks of 4,096 in two passes; it unrolled into a program so long that start-up took 141 seconds and the server held 5.6 GB of memory instead of 1.3, for a slower kernel (0.14 ms).
 
+### 5.7 Speculative decoding with the MTP block (phase 3)
+
+Qwen3.8's GGUFs carry one block after the main layers (`blk.64` on the 27B, `nextn_predict_layers` = 1) that tinygrad leaves unloaded: one gated-attention layer of the main architecture with its own KV cache, fed `eh_proj(concat(enorm(embed(token)), hnorm(h)))` where h is the main model's output-normed hidden, and finished by its own norm and the main output head (llama.cpp, `graph_mtp`). `tinyllm.tg.mtp` loads it from the state-dict entries tinygrad's loader leaves over.
+
+**The block works as a drafter.** Teacher-forced over greedy outputs of the 27B (`tools/mtp_check.py`, 640 generated tokens over four prompts), its first draft matches the main model's next token 89.5% of the time: 95% on code, 77% on a children's explanation, 91% on a table, 96% on a reasoning answer.
+
+**A verify pass costs little more than a decode pass.** Main-model calls with logits at every row, `UD-Q4_K_XL`:
+
+| Rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|------|---|---|---|---|---|---|---|---|
+| ms | 79.6 | 81.3 | 82.3 | 85.0 | 87.0 | 90.4 | 91.5 | 94.3 |
+
+Up to 8 rows the quantized decode kernels read each weight once for all rows.
+
+**One cycle, one wait.** A cycle is one captured program (`tinyllm.tg.speculative`): the MTP block over the K + 1 rows of the previous verify (each main-model hidden paired with the token the main model chose there), which writes its KV for the accepted rows and yields the first draft from the last accepted one; K - 1 more MTP steps chained on the GPU; then the main model over the last token and the K drafts, with the device sampler at every row. The host reads back K + 1 sampler results and the number of drafts that matched, so one cycle has one wait and no per-draft host work. The tokens produced are the main model's own samples at rows 0..n.
+
+**Rolling back the recurrent layers.** A rejected draft's KV entry is past the accepted position and is simply overwritten later. The 48 DeltaNet layers fold every token into their state, so the verify keeps each layer's state after every row (151 MB per row over the 48 layers) and its convolution window, and when n < K the state after row n is copied back before the next call.
+
+**Same tokens as plain decoding, bit for bit.** The first working version gave the same greedy text as plain decoding on two of four prompts and differed after about 106 tokens on the other two, both at near ties (top-2 margins 0.027 and 0.012). Tracing layer by layer, first on the 0.8B model and then on the 27B, turned up five places where a call of a few rows rounds differently from one-row calls:
+
+1. tinygrad's attention needs multiples of 32 rows for its tiled kernel, so a 4-row call took the generic float32 path while decoding uses the flash decode kernel with half-precision queries: about 1e-3 per layer, 0.29 in the final logits on the 0.8B model.
+2. The query and key norms run after a transpose and reduce in another order for several rows, which now and then flips a half-precision rounding.
+3. The DeltaNet scan compiled for several tokens fuses multiplies and adds differently from the one-token kernel (a few units in the last place in 0.7% of the state). Even one-token kernels writing to different slots of one snapshot buffer rounded differently from each other.
+4. tinygrad's IQ4_XS decode kernel computes `dot * (d * (sc - 32))`. Its C renderer prints a product inlined into a product without parentheses, so the one-row kernel evaluates `((dot * d) * (sc - 32))`, while with several rows `d * (sc - 32)` is shared between rows and kept as written. IQ4_XS is 22% of `UD-Q4_K_XL`; every other weight type gives identical rows.
+5. Writing the four rows' keys into the cache with one store fuses RoPE into a store kernel of another shape; one key element in 6,144 came out different.
+
+The verify now runs each block's projections over all rows and everything else one row at a time with decoding's shapes and kernels: attention through the decode kernel per row with that row's own key range, keys and values stored row by row, and the scan as one-token kernels that read the previous row's state and write the next row's snapshot, each in its own buffer so that all rows share one compiled kernel. tinyllm has its own IQ4_XS decode kernel for up to 8 rows, tinygrad's with the product written left to right: the same speed for 1 to 3 rows, up to 20% slower at 8 rows on two layer shapes. `tools/rollback_check.py` compares logits at every row, every snapshot and the final state with one-token decoding: identical, bit for bit, on the 0.8B model and on the 27B. With the uniform number of each sampled position fixed by the seed and the position, seeded sampling gives the same tokens with speculation on and off too.
+
+**Speed, `UD-Q4_K_XL`, K = 3**, as served by default (Q4_0 draft head and top-k argmax, below; `tools/spec_check.py`, 256 tokens per prompt, plain decoding 12.5 tok/s on every prompt, output identical to plain decoding on every row):
+
+| Prompt | Greedy tok/s | Tokens per cycle | Seeded tok/s | Tokens per cycle |
+|--------|--------------|------------------|--------------|------------------|
+| Python function with tests | 34.9 | 3.70 | 28.8 | 3.07 |
+| How a refrigerator works, for a child | 26.6 | 2.83 | 22.7 | 2.43 |
+| TCP and UDP, table and summary | 27.5 | 2.93 | 26.8 | 2.87 |
+| Short story | 20.7 | 2.22 | 19.0 | 2.04 |
+| Train timetable puzzle, thinking on | 33.3 | 3.54 | 32.3 | 3.45 |
+| All five | 27.6 | | 25.0 | |
+
+With the model's own head a cycle takes about 114 ms (about 110 before the verify was made exact). Profiled (`tools/profile_step.py --kind speculate3`): 91 ms for the 4-row verify and 22 ms of drafting, 19 ms of it in Q6_K kernels, mostly the 1 GB output head read once per draft. Seeded sampling (temperature 1, top-k 20, top-p 0.95) accepts less than greedy because the main model's own draw at each row must equal the MTP's most likely token.
+
+**Drafts per cycle.** Greedy, the model's own head, the same five prompts (tok/s):
+
+| K | All five | Code | Child explanation | TCP and UDP | Story | Puzzle | ms per cycle |
+|---|----------|------|-------------------|-------------|-------|--------|--------------|
+| 2 | 25.3 | 28.9 | 24.5 | 25.0 | 21.6 | 27.8 | 99 |
+| 3 | 26.5 | 32.5 | 25.4 | 26.6 | 20.2 | 31.8 | 114 |
+| 4 | 26.9 | 37.8 | 25.2 | 26.1 | 19.3 | 33.8 | 120 |
+| 5 | 26.4 | 38.7 | 24.1 | 27.2 | 17.8 | 34.7 | 132 |
+
+The best K depends on the text: 5 for code, 2 for the story. Choosing it per prompt would give 28.2 tok/s over the five, which is what an adaptive draft length (item 3e) can aim for. Sampling accepts less than greedy, which favours a smaller K; the default is 3.
+
+**A cheaper head for drafting.** Drafting needs only the MTP's most likely token, and the verify uses the real head, so the draft head can be coarser without touching the output. A Q4_0 copy of the head (now the default; `TINYLLM_DRAFT_HEAD=output` drafts with the model's own; 0.71 GB against 1.04 GB in Q6_K) gives the same tokens per cycle and 27.7 tok/s over the five prompts instead of 26.5 (K = 3). A Q4_0 copy of only the first 98,304 rows (`q4:98304`, 0.27 GB) gives 29.3, since BPE ids roughly follow frequency and 99.75% or more of the tokens in English prose, Python and C++ fall below that id. It is not the default: below it fall only 48% of the tokens of a Chinese text, 44% of Japanese, 46% of Russian and 82% of French, whose drafts would then nearly always miss. Quantizing the full head at load takes about a second in one pass (15 s in sixteen slices, which mostly cost scheduling). On `UD-Q8_K_XL`, whose head is BF16 (2.5 GB), the Q4_0 copy matters more: 18.7 tok/s against 16.1 over three prompts (K = 3), plain decoding 7.4, output identical, and the verify bit for bit as on `UD-Q4_K_XL` (`tools/rollback_check.py`).
+
+The drafts' argmax over 248,320 logits went through tinygrad's generic reduction, about 0.7 ms per draft; the top-k kernel with k = 1 does it in two passes of the bitonic sort.
+
+**Through the server.** `tinyllm serve` turns speculation on by default when the GGUF has an MTP block (`--speculative K`, 0 for off). The OpenAI SDK checks (`tools/openai_sdk_check.py`) all pass with it: streaming, reasoning on and off, stop sequences, seeds, a tool-call round trip, two clients at once. The speed check's long story, sampled at Qwen3.8's defaults (temperature 1, top-k 20, top-p 0.95), streams at 18.9 tok/s, the hardest case of the table above; short chat answers in the same run stream at 26 to 38 tok/s. Prefill of the 6,412-token prompt runs at 311 tok/s against 317 without the MTP block, which now also runs over every prompt chunk to fill its own KV cache. Start-up: 19 s to load and 138 s to compile. Soak (`tools/soak.py`, 30 minutes): 878 requests of five kinds, 175 of them streams abandoned and cancelled, none failed; server memory 1,598.8 MB after warm-up and 1,604.6 MB at the end, flat over the last ten minutes (1.3 GB without speculation); 68% of 19,578 drafts accepted.
+
 ## 6. External baselines (published, not reproduced here)
 
 llama.cpp, Qwen3.8-27B on Strix Halo:

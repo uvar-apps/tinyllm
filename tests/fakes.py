@@ -17,7 +17,9 @@ class CountingRunner:
         self.vocab_size, self.max_context, self.fail_on, self.delay = vocab_size, max_context, fail_on, delay
         self.tokens: list[int] = []
         self.calls: list[int] = []  # tokens per feed call
+        self.followings: list[int | None] = []  # the `following` token each feed call was given
         self.device_sampling = False
+        self.speculative = 0
 
     def begin(self, tokens: Sequence[int]) -> int:
         held = len(self.tokens)
@@ -26,7 +28,8 @@ class CountingRunner:
         self.tokens = []
         return 0
 
-    def feed(self, tokens: Sequence[int]) -> np.ndarray:
+    def feed(self, tokens: Sequence[int], following: int | None = None) -> np.ndarray:
+        self.followings.append(following)
         if self.fail_on is not None and self.fail_on in tokens:
             raise RuntimeError("device fault")
         if self.delay:
@@ -51,7 +54,11 @@ class DeviceCountingRunner(CountingRunner):
 
     def feed_sampled(self, token: int, params: Sequence[float]) -> np.ndarray:
         self.sampled_calls += 1
-        x = self.feed([token]).astype(np.float64)
+        return self._sample(self.feed([token]), params)
+
+    @staticmethod
+    def _sample(logits: np.ndarray, params: Sequence[float]) -> np.ndarray:
+        x = logits.astype(np.float64)
         k = 32
         order = np.lexsort((np.arange(x.size), -x))[:k]
         vals = x[order]
@@ -63,6 +70,35 @@ class DeviceCountingRunner(CountingRunner):
         choice = min(int(np.sum(np.cumsum(q) <= u)), k - 1)
         lse = float(np.log(np.sum(np.exp(x - x.max()))) + x.max())
         return np.concatenate([[order[choice], lse], vals, order]).astype(np.float32)
+
+
+class SpecCountingRunner(DeviceCountingRunner):
+    """DeviceCountingRunner with draft-and-verify cycles. The draft model counts upward too, but its draft at
+    each position in `wrong` is off by one; the verify samples every row as `feed_sampled` would."""
+
+    def __init__(self, speculative: int = 3, wrong: frozenset[int] = frozenset(), **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.speculative, self.wrong = speculative, wrong
+        self.cycles: list[int] = []  # accepted drafts per cycle
+
+    def feed_speculative(self, token: int, params: Sequence[Sequence[float]]) -> tuple[np.ndarray, int]:
+        k, start = self.speculative, len(self.tokens) + 1  # the position of the first draft
+        drafts, last = [], token
+        for i in range(k):
+            last = (last + 1 + (1 if start + i in self.wrong else 0)) % self.vocab_size
+            drafts.append(last)
+        held = list(self.tokens)
+        rows, n, fed = [], 0, [token, *drafts]
+        for j in range(k + 1):
+            self.tokens = held + fed[: j + 1]
+            logits = (-10.0 - 1e-3 * np.arange(self.vocab_size)).astype(np.float32)
+            logits[(self.tokens[-1] + 1) % self.vocab_size] = 10.0
+            rows.append(self._sample(logits, params[j]))
+        while n < k and int(rows[n][0]) == drafts[n]:
+            n += 1
+        self.tokens = held + fed[: n + 1]
+        self.cycles.append(n)
+        return np.stack(rows), n
 
 
 class ByteTokenizer:
@@ -114,6 +150,7 @@ class ScriptRunner:
         self.step = 0
         self.prompts: list[list[int]] = []
         self.device_sampling = False
+        self.speculative = 0
         self.hold: object | None = None  # a threading.Event: feed waits for it (to keep a request running)
 
     def begin(self, tokens: Sequence[int]) -> int:
@@ -121,7 +158,7 @@ class ScriptRunner:
         self.tokens, self.step = [], 0
         return 0
 
-    def feed(self, tokens: Sequence[int]) -> np.ndarray:
+    def feed(self, tokens: Sequence[int], following: int | None = None) -> np.ndarray:
         if self.hold is not None:
             self.hold.wait()  # type: ignore[attr-defined]
         self.tokens.extend(int(t) for t in tokens)

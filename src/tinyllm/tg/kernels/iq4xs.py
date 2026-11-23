@@ -10,6 +10,13 @@ the eight 6-bit group scales, word 1 their low four bits, then 16 bytes per grou
 the code of weight j in its low nibble and of weight j + 16 in its high nibble. A code n means the int8 value
 kvalues_iq4nl[n], and a weight is d * (sc - 32) * kvalues_iq4nl[n].
 
+Decode (up to 8 rows): tinygrad's integer-dot kernel, with one change (`_iq4xs_decode_kernel`). tinygrad computes a
+group's total as dot * (d * (sc - 32)); its C renderer prints a product inlined into a product without
+parentheses, so with one row the kernel evaluates ((dot * d) * (sc - 32)), while with several rows d * (sc - 32)
+is shared between rows and kept as written. The rows of a several-row call then differ from one-row calls by a few
+units in the last place, which a speculative verify (tinyllm.tg.speculative) must not. Here the product is written
+left to right, so every row count evaluates what tinygrad's one-row kernel does.
+
 As in tinygrad, a 256-entry table in local memory maps a code byte to the two fp16 values of its nibbles. Both
 halves of a group (weights 0-15, 16-31) are converted in the same loop step, so one table load serves two
 weights. A packed conversion is kept as an option (PACKED = True): one v_perm_b32 collects the low (or high)
@@ -26,16 +33,20 @@ from typing import Any
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import prod
-from tinygrad.llm.kernels.amd import _is_cdna, _is_rdna4
+from tinygrad.llm.kernels.amd import _amd_load, _is_cdna, _is_rdna4
 from tinygrad.llm.kernels.amd_gguf import (
     IQ4_XS,
     QUANT_SIZES,
     _amd_byte_perm,
+    _amd_dp4a,
+    _decode_linear,
     _half,
     _iq4_scale,
+    _quant_word,
     _wmma_layout,
     _wmma_words,
     iq4_half_lut,
+    q8_quantize,
 )
 
 from tinyllm.tg.kernels.wmma import scale_pair, splat_half, wmma_linear
@@ -160,10 +171,51 @@ def find_iq4xs(layer: Any) -> tuple[int, Tensor] | None:
     return found if found is not None and found[0] == IQ4_XS else None
 
 
+DECODE_ROWS = 8  # up to this many rows (not a multiple of 16) take `_iq4xs_decode_kernel`
+
+
+@functools.cache
+def _iq4xs_decode_kernel(
+    out: UOp, raw: UOp, xq: UOp, xd: UOp, xs: UOp, *, out_features: int, in_features: int, cdna: bool
+) -> UOp:
+    """tinygrad's `_quant_decode_kernel` for IQ4_XS with the group total written left to right (module notes)."""
+    token_tile = tokens if (tokens := int(out.shape[0])) <= 8 else 1
+    words = QUANT_SIZES[IQ4_XS] // raw.dtype.itemsize
+
+    def group_dot(token: UOp, output: UOp, group: UOp) -> UOp:
+        block, subgroup = group // 8, group % 8
+        base = (output * in_features // 256 + block) * words
+        xwords = _amd_load(xq[token, group, 0], 8)
+        dot = UOp.const(0, dtypes.int32)
+        for i in range(8):
+            dot = _amd_dp4a(_quant_word(raw, base, subgroup, i, IQ4_XS, None), xwords[i], dot, cdna)
+        header, low = raw[base].load(), raw[base + 1].load()
+        scale = ((low >> (4 * subgroup)) & 15) | (((header >> (16 + 2 * subgroup)) & 3) << 4)
+        return dot.float() * _half(header) * (scale.cast(dtypes.int32) - 32).float() * xd[token, group]
+
+    return _decode_linear(out, out_features, in_features // 32, group_dot, "linear_iq4_xs", token_tile)
+
+
+def _iq4xs_decode(layer: Any, x: Tensor, tokens: int, in_features: int, out_features: int) -> Tensor:
+    """What tinygrad's `q8_linear` does for a few rows of an IQ4_XS layer, with `_iq4xs_decode_kernel`."""
+    xq, xd, xs = q8_quantize(x.reshape(tokens, in_features).contiguous(), tokens, in_features)
+    fxn = functools.partial(
+        _iq4xs_decode_kernel, out_features=out_features, in_features=in_features, cdna=_is_cdna(x.device)
+    )
+    chunks = (in_features + 1023) // 1024
+    out = Tensor.empty(tokens, out_features, chunks, dtype=dtypes.float32, device=x.device)
+    result = Tensor.custom_kernel(out, layer.weight, xq, xd, xs, fxn=fxn)[0].sum(-1)
+    result = result.reshape(*x.shape[:-1], out_features)
+    return result if layer.bias is None else result + layer.bias
+
+
 def iq4xs_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]) -> Tensor:
-    """`layer(x)` for an IQ4_XS layer: matrix cores for multiples of 16 rows, tinygrad's path otherwise."""
+    """`layer(x)` for an IQ4_XS layer: matrix cores for multiples of 16 rows, `_iq4xs_decode_kernel` for up to
+    DECODE_ROWS rows, tinygrad's path otherwise."""
     in_features, out_features = int(layer.in_features), int(layer.out_features)
     tokens = int(prod(x.shape[:-1]))
+    if tokens <= DECODE_ROWS and tokens % 16 and layer.groups == 1 and layer.shard_axis is None:
+        return _iq4xs_decode(layer, x, tokens, in_features, out_features)
     overrides = GROUPS_PER_STEP is not None or PACKED is not None or LDS_BYTES is not None or TILES is not None
     above = SERVES_ROWS is not None and tokens > SERVES_ROWS and not overrides
     if tokens % 16 or out_features % 16 or in_features % 256 or above:

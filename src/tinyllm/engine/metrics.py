@@ -49,6 +49,14 @@ class Metrics:
     cached_tokens: int = 0
     queue_time: Histogram = field(default_factory=Histogram)
     first_token_time: Histogram = field(default_factory=Histogram)
+    spec_cycles: int = 0  # draft-and-verify cycles
+    spec_draft_tokens: int = 0  # drafts proposed
+    spec_accepted_tokens: int = 0  # drafts the main model agreed with
+
+    def record_cycle(self, drafts: int, accepted: int) -> None:
+        self.spec_cycles += 1
+        self.spec_draft_tokens += drafts
+        self.spec_accepted_tokens += accepted
 
     def record_finish(
         self, reason: str, prompt: int, generated: int, cached: int, queued: float, first_token: float | None
@@ -78,6 +86,9 @@ class Metrics:
             ("prompt_tokens_total", self.prompt_tokens, "Prompt tokens of finished requests."),
             ("generation_tokens_total", self.generation_tokens, "Generated tokens of finished requests."),
             ("prefix_cache_hit_tokens_total", self.cached_tokens, "Prompt tokens served from reused state."),
+            ("spec_decode_num_drafts_total", self.spec_cycles, "Speculative draft-and-verify cycles."),
+            ("spec_decode_num_draft_tokens_total", self.spec_draft_tokens, "Tokens drafted by the MTP block."),
+            ("spec_decode_num_accepted_tokens_total", self.spec_accepted_tokens, "Drafted tokens accepted."),
         ):
             lines += [f"# HELP {p}_{name} {text}", f"# TYPE {p}_{name} counter", f"{p}_{name} {value}"]
         lines += self.queue_time.render(f"{p}_queue_time_seconds", "Time from arrival to start.")

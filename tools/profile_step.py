@@ -40,12 +40,17 @@ for setting in sys.argv[5:]:  # module.NAME=value, applied to tinyllm.tg.kernels
     target, value = setting.split("=", 1)
     module, name = target.rsplit(".", 1)
     setattr(importlib.import_module(f"tinyllm.tg.kernels.{module}"), name, ast.literal_eval(value))
-s = UpstreamSession(path, 2048, rows=rows, chunk=chunk)
+k = int(kind[len("speculate"):] or 3) if kind.startswith("speculate") else 0
+s = UpstreamSession(path, 2048, rows=rows, chunk=chunk, logits=bool(k), speculative=k)
 prompt = [1000 + i % 1000 for i in range(chunk)]
 for _ in range(4): s.prefill(prompt)
-for _ in range(4): s.step()
+if k:
+    rows_ = [[0.0, 1.0, 1.0, 0.0, 0.0]] * (k + 1)
+    for _ in range(4): s.speculate(1000, rows_)
+else:
+    for _ in range(4): s.step()
 print("MARK_START", flush=True)
-s.prefill(prompt) if kind == "prefill" else s.step()
+s.prefill(prompt) if kind == "prefill" else s.speculate(1000, rows_) if k else s.step()
 print("MARK_END", flush=True)
 """.replace("MARK_START", MARK_START).replace("MARK_END", MARK_END)
 
@@ -68,7 +73,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model")
     ap.add_argument("--rows", type=int, default=1)
-    ap.add_argument("--kind", choices=("decode", "prefill"), default="decode")
+    ap.add_argument(
+        "--kind",
+        default="decode",
+        help="decode, prefill, or speculate[K]: one draft-and-verify cycle of K drafts (default 3), split into the "
+        "drafting part and the verify part at the first DeltaNet scan of the verify",
+    )
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument(
@@ -102,6 +112,21 @@ def main() -> None:
     print(f"{'ms':>8} {'share':>6} {'calls':>5}  kernel")
     for name, times in sorted(by_name.items(), key=lambda kv: -sum(kv[1]))[: args.top]:
         print(f"{sum(times) * 1e3:8.2f} {100 * sum(times) / total:5.1f}% {len(times):5d}  {name}")
+    if args.kind.startswith("speculate"):
+        first = next((i for i, (name, _) in enumerate(kernels) if "gated_delta_row" in name), len(kernels))
+        # the verify's first layer starts a few kernels before its scan: its projections and convolution
+        start = max(0, first - 8)
+        draft, verify = kernels[:start], kernels[start:]
+        print(
+            f"\ndrafting: {sum(t for _, t in draft) * 1e3:.1f} ms in {len(draft)} kernels; "
+            f"verify: {sum(t for _, t in verify) * 1e3:.1f} ms in {len(verify)} kernels"
+        )
+        for title, part in (("drafting", draft), ("verify", verify)):
+            groups: dict[str, float] = defaultdict(float)
+            for name, t in part:
+                groups[name] += t
+            top = sorted(groups.items(), key=lambda kv: -kv[1])[:8]
+            print(f"  {title}: " + ", ".join(f"{n} {t * 1e3:.1f}" for n, t in top))
 
 
 if __name__ == "__main__":
