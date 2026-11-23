@@ -1,0 +1,214 @@
+{
+  "schema": 1,
+  "created": "2026-11-23T05:38:37+00:00",
+  "tinyllm": "0.0.1",
+  "tinygrad_rev": "cdabdcba0747eae78b136cb79db1e12492441eda",
+  "host": {
+    "cpu": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "memory_gib": 123.5,
+    "kernel": "7.2.9-2-cachyos",
+    "python": "3.13.14",
+    "power_profile": "performance"
+  },
+  "device": {
+    "device": "AMD",
+    "dev_env": "KFD+AMD",
+    "renderer": "HIPRenderer",
+    "arch": "gfx1151",
+    "target": [
+      11,
+      5,
+      1
+    ],
+    "cu_cnt": 40,
+    "wave_cnt": 1280,
+    "interface": "KFDIface"
+  },
+  "model": {
+    "file": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+    "bytes": 31457991680,
+    "fingerprint": "b2309559ac8655c7"
+  },
+  "cases": [
+    {
+      "config": {
+        "model": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+        "device": null,
+        "rows": 1,
+        "chunk": 32,
+        "mode": "sample",
+        "prefill_tokens": 256,
+        "decode_steps": 32,
+        "max_context": 4096
+      },
+      "result": {
+        "load_s": 16.761689344013575,
+        "warmup_s": 33.254041916981805,
+        "prefill": {
+          "median_ms": 162.9879620159045,
+          "min_ms": 162.24646603222936,
+          "p90_ms": 163.60258299391717,
+          "samples": 5,
+          "tok_s": 196.33351815809203,
+          "pipelined_tok_s": 200.19831410249705,
+          "pipelined_ms_per_call": 159.84150587610202
+        },
+        "decode": {
+          "median_ms": 135.81983599578962,
+          "min_ms": 135.78298804350197,
+          "p90_ms": 135.90763398678973,
+          "samples": 29,
+          "tok_s": 7.362694798357729,
+          "tok_s_per_row": 7.362694798357729,
+          "gb_per_step": 30.187911752,
+          "gb_s": 222.26438082973254
+        },
+        "device": {
+          "device": "AMD",
+          "dev_env": "KFD+AMD",
+          "renderer": "HIPRenderer",
+          "arch": "gfx1151",
+          "target": [
+            11,
+            5,
+            1
+          ],
+          "cu_cnt": 40,
+          "wave_cnt": 1280,
+          "interface": "KFDIface"
+        },
+        "kernels": [
+          "dense",
+          "dense_mm",
+          "q4",
+          "q45k",
+          "iq4xs",
+          "q6k",
+          "q8"
+        ],
+        "static_chunks": true,
+        "tinygrad_rev": "cdabdcba0747eae78b136cb79db1e12492441eda"
+      }
+    },
+    {
+      "config": {
+        "model": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+        "device": null,
+        "rows": 8,
+        "chunk": 32,
+        "mode": "sample",
+        "prefill_tokens": 256,
+        "decode_steps": 32,
+        "max_context": 4096
+      },
+      "result": {
+        "load_s": 17.120455114985816,
+        "warmup_s": 44.305595520010684,
+        "prefill": {
+          "median_ms": 732.8579939785413,
+          "min_ms": 732.2337329969741,
+          "p90_ms": 736.0549530130811,
+          "samples": 5,
+          "tok_s": 349.31733310327496,
+          "pipelined_tok_s": 342.74828714598203,
+          "pipelined_ms_per_call": 746.9038055060082
+        },
+        "decode": {
+          "median_ms": 162.6672919956036,
+          "min_ms": 162.58364502573386,
+          "p90_ms": 162.7808390185237,
+          "samples": 29,
+          "tok_s": 49.18013880882837,
+          "tok_s_per_row": 6.147517351103546,
+          "gb_per_step": 34.73653582,
+          "gb_s": 213.54345667067983
+        },
+        "device": {
+          "device": "AMD",
+          "dev_env": "KFD+AMD",
+          "renderer": "HIPRenderer",
+          "arch": "gfx1151",
+          "target": [
+            11,
+            5,
+            1
+          ],
+          "cu_cnt": 40,
+          "wave_cnt": 1280,
+          "interface": "KFDIface"
+        },
+        "kernels": [
+          "dense",
+          "dense_mm",
+          "q4",
+          "q45k",
+          "iq4xs",
+          "q6k",
+          "q8"
+        ],
+        "static_chunks": true,
+        "tinygrad_rev": "cdabdcba0747eae78b136cb79db1e12492441eda"
+      }
+    },
+    {
+      "config": {
+        "model": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+        "device": null,
+        "rows": 1,
+        "chunk": 128,
+        "mode": "sample",
+        "prefill_tokens": 1024,
+        "decode_steps": 32,
+        "max_context": 4096
+      },
+      "result": {
+        "load_s": 17.31795754795894,
+        "warmup_s": 34.07551552797668,
+        "prefill": {
+          "median_ms": 367.1472599962726,
+          "min_ms": 366.72784300753847,
+          "p90_ms": 369.36977895675227,
+          "samples": 5,
+          "tok_s": 348.63395140494714,
+          "pipelined_tok_s": 346.66070738704417,
+          "pipelined_ms_per_call": 369.2371165016084
+        },
+        "decode": {
+          "median_ms": 136.84009603457525,
+          "min_ms": 136.79253601003438,
+          "p90_ms": 136.8922830442898,
+          "samples": 29,
+          "tok_s": 7.307799606829645,
+          "tok_s_per_row": 7.307799606829645,
+          "gb_per_step": 30.247680584,
+          "gb_s": 221.0439882792639
+        },
+        "device": {
+          "device": "AMD",
+          "dev_env": "KFD+AMD",
+          "renderer": "HIPRenderer",
+          "arch": "gfx1151",
+          "target": [
+            11,
+            5,
+            1
+          ],
+          "cu_cnt": 40,
+          "wave_cnt": 1280,
+          "interface": "KFDIface"
+        },
+        "kernels": [
+          "dense",
+          "dense_mm",
+          "q4",
+          "q45k",
+          "iq4xs",
+          "q6k",
+          "q8"
+        ],
+        "static_chunks": true,
+        "tinygrad_rev": "cdabdcba0747eae78b136cb79db1e12492441eda"
+      }
+    }
+  ]
+}

@@ -144,7 +144,9 @@ class _Reader:
         raise GGUFError(f"unknown metadata value type {type_id}")
 
 
-def _read_part(path: Path, part: int, max_array_items: int) -> tuple[int, dict[str, Any], list[TensorInfo]]:
+def _read_part(
+    path: Path, part: int, max_array_items: int, check_data: bool = True
+) -> tuple[int, dict[str, Any], list[TensorInfo]]:
     size = path.stat().st_size
     with path.open("rb") as f:
         r = _Reader(f, size, max_array_items)
@@ -170,22 +172,24 @@ def _read_part(path: Path, part: int, max_array_items: int) -> tuple[int, dict[s
             tensors.append(info)
         alignment = int(kv.get("general.alignment", 32))
         data_start = (f.tell() + alignment - 1) // alignment * alignment
-        for t in tensors:
+        for t in tensors if check_data else ():
             if data_start + t.offset + t.nbytes > size:
                 raise GGUFError(f"tensor {t.name!r} extends past the end of {path.name}")
     return version, kv, tensors
 
 
-def read(path: str | Path, max_array_items: int = 64) -> GGUFFile:
+def read(path: str | Path, max_array_items: int = 64, header_only: bool = False) -> GGUFFile:
     """Parse the header of a GGUF file. For a split model pass the first part; the rest are found next to it.
 
     Arrays longer than `max_array_items` are skipped and returned as `ArraySummary`.
+    `header_only` accepts a file cut short after its tensor directory (see tools/fetch_gguf_header.sh):
+    tensor data is not required to be present, and other parts of a split model are not read.
     """
     first = Path(path).expanduser()
-    version, kv, tensors = _read_part(first, 0, max_array_items)
+    version, kv, tensors = _read_part(first, 0, max_array_items, check_data=not header_only)
     parts = [first]
     total = int(kv.get("split.count", 1))
-    if total > 1:
+    if total > 1 and not header_only:
         m = _SPLIT_RE.match(first.name)
         if not m or int(m.group(2)) != 1 or int(kv.get("split.no", 0)) != 0:
             raise GGUFError(f"{first.name} belongs to a {total}-part model; pass the first part (-00001-of-...)")

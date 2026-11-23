@@ -11,7 +11,7 @@ from typing import Any
 from tinyllm.models import memory, spec
 from tinyllm.weights import gguf, quant
 
-_BLOCK_RE = re.compile(r"^blk\.\d+\.")
+_BLOCK_RE = re.compile(r"^blk\.(\d+)\.")
 # 2-D weights that are looked up or applied elementwise, not multiplied as a linear layer
 _NOT_LINEAR = ("token_embd.weight", "per_layer_token_embd.weight")
 
@@ -20,8 +20,10 @@ def _is_linear(t: gguf.TensorInfo) -> bool:
     return len(t.shape) == 2 and t.name.endswith(".weight") and t.name not in _NOT_LINEAR and "conv1d" not in t.name
 
 
-def report(path: str | Path, context: int, slots: int, state_store: int | None = None) -> dict[str, Any]:
-    g = gguf.read(path)
+def report(
+    path: str | Path, context: int, slots: int, state_store: int | None = None, header_only: bool = False
+) -> dict[str, Any]:
+    g = gguf.read(path, header_only=header_only)
     s = spec.from_gguf(g)
     params = sum(t.elements for t in g.tensors)
 
@@ -29,18 +31,31 @@ def report(path: str | Path, context: int, slots: int, state_store: int | None =
     for t in g.tensors:
         by_type[t.qtype.name] += t.elements
 
-    # which linear layers would miss the packed-weight kernels and fall back to a slow path
-    linear = [t for t in g.tensors if _is_linear(t)]
-    slow = [t for t in linear if quant.kernel_path(t.qtype, t.shape[0], t.shape[1]) == quant.GENERIC]
-    slow_families: Counter[str] = Counter()
-    for t in slow:
-        slow_families[f"{_BLOCK_RE.sub('blk.N.', t.name)} [{t.qtype.name}]"] += t.elements
+    # which linear layers would miss the packed-weight kernels and fall back to a slow path; tensors of
+    # the MTP blocks (numbered after the main blocks) are only used for speculative decoding
+    def is_mtp(t: gguf.TensorInfo) -> bool:
+        m = _BLOCK_RE.match(t.name)
+        return m is not None and int(m.group(1)) >= s.blocks
+
+    linear = [t for t in g.tensors if _is_linear(t) and not is_mtp(t)]
+    mtp_linear = [t for t in g.tensors if _is_linear(t) and is_mtp(t)]
+
+    def slow_of(tensors: list[gguf.TensorInfo]) -> tuple[list[gguf.TensorInfo], dict[str, int]]:
+        slow = [t for t in tensors if quant.kernel_path(t.qtype, t.shape[0], t.shape[1]) == quant.GENERIC]
+        families: Counter[str] = Counter()
+        for t in slow:
+            families[f"{_BLOCK_RE.sub('blk.N.', t.name)} [{t.qtype.name}]"] += t.elements
+        return slow, dict(families.most_common())
+
+    slow, slow_families = slow_of(linear)
+    _, mtp_slow_families = slow_of(mtp_linear)
     linear_params = sum(t.elements for t in linear)
 
     out: dict[str, Any] = {
         "file": str(g.path),
         "parts": len(g.parts),
-        "file_bytes": g.file_bytes,
+        "header_only": header_only,
+        "file_bytes": g.tensor_bytes if header_only else g.file_bytes,
         "tensor_bytes": g.tensor_bytes,
         "tensors": len(g.tensors),
         "parameters": params,
@@ -50,7 +65,8 @@ def report(path: str | Path, context: int, slots: int, state_store: int | None =
         "undecodable_types": sorted({t.qtype.name for t in g.tensors if not t.qtype.upstream}),
         "linear_parameters": linear_params,
         "fast_kernel_share": 1 - sum(t.elements for t in slow) / linear_params if linear_params else 0.0,
-        "slow_linear_families": dict(slow_families.most_common()),
+        "slow_linear_families": slow_families,
+        "mtp_slow_linear_families": mtp_slow_families,
         "sampling_defaults": {k.split(".")[-1]: v for k, v in g.kv.items() if k.startswith("general.sampling.")},
         "plan": None,
     }
@@ -78,7 +94,8 @@ def render(r: dict[str, Any]) -> str:
     lines = [
         f"{s['name']}  ({s['architecture']})",
         f"  file          {r['file']}" + (f"  ({r['parts']} parts)" if r["parts"] > 1 else ""),
-        f"  size          {_gb(r['file_bytes']).strip()}, {r['parameters'] / 1e9:.2f} B parameters"
+        f"  size          {_gb(r['file_bytes']).strip()}{' of tensors (header only)' if r['header_only'] else ''},"
+        f" {r['parameters'] / 1e9:.2f} B parameters"
         f" in {r['tensors']} tensors, {r['bits_per_weight']:.2f} bits per weight",
         f"  shape         {s['blocks']} blocks"
         + (f" + {s['mtp_blocks']} MTP" if s["mtp_blocks"] else "")
@@ -96,9 +113,16 @@ def render(r: dict[str, Any]) -> str:
     if r["undecodable_types"]:
         lines.append(f"  NOT decodable by the pinned tinygrad: {', '.join(r['undecodable_types'])}")
 
-    lines.append(f"\nLinear layers on fast AMD kernels: {100 * r['fast_kernel_share']:.1f}% of their parameters")
+    lines.append(
+        f"\nLinear layers on fast AMD kernels (tinygrad's and tinyllm's): "
+        f"{100 * r['fast_kernel_share']:.1f}% of their parameters"
+    )
     for family, n in r["slow_linear_families"].items():
         lines.append(f"  generic path: {family}  ({n / 1e6:.0f} M parameters)")
+    if r["mtp_slow_linear_families"]:
+        lines.append("  MTP block, used only for speculative decoding:")
+        for family, n in r["mtp_slow_linear_families"].items():
+            lines.append(f"    generic path: {family}  ({n / 1e6:.0f} M parameters)")
 
     st = s["state"]
     if st is None:

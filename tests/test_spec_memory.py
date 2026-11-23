@@ -77,14 +77,27 @@ def test_inspect_report_flags_generic_path(tmp_path: Path) -> None:
     tensors = [
         ("token_embd.weight", (256, 100), "Q4_K"),
         ("blk.0.ffn_gate.weight", (256, 1024), "Q4_K"),
-        ("blk.3.attn_q.weight", (256, 4096), "BF16"),
+        ("blk.3.attn_q.weight", (256, 4096), "Q5_1"),
         ("output.weight", (256, 100), "Q6_K"),
     ]
     path = write_gguf(tmp_path / "m.gguf", qwen35_kv(), tensors)
     r = inspection.report(path, context=1024, slots=2)
-    assert r["types"]["BF16"] == 256 * 4096
-    assert list(r["slow_linear_families"]) == ["blk.N.attn_q.weight [BF16]"]
+    assert r["types"]["Q5_1"] == 256 * 4096
+    assert list(r["slow_linear_families"]) == ["blk.N.attn_q.weight [Q5_1]"]
     assert 0 < r["fast_kernel_share"] < 1
     assert r["plan"]["slots"] == 2 and r["plan"]["context"] == 1024
     text = inspection.render(r)
-    assert "tiny-qwen35" in text and "generic path: blk.N.attn_q.weight [BF16]" in text and "Memory plan" in text
+    assert "tiny-qwen35" in text and "generic path: blk.N.attn_q.weight [Q5_1]" in text and "Memory plan" in text
+
+
+def test_inspect_reports_mtp_block_tensors_separately(tmp_path: Path) -> None:
+    # qwen35_kv() declares 8 main blocks plus one MTP block, which is blk.8
+    tensors = [
+        ("blk.0.ffn_gate.weight", (256, 1024), "Q4_K"),
+        ("blk.8.ffn_gate.weight", (256, 1024), "Q5_1"),
+        ("blk.8.nextn.eh_proj.weight", (512, 256), "Q5_1"),
+    ]
+    r = inspection.report(write_gguf(tmp_path / "m.gguf", qwen35_kv(), tensors), context=1024, slots=1)
+    assert r["fast_kernel_share"] == 1.0 and r["slow_linear_families"] == {}
+    assert set(r["mtp_slow_linear_families"]) == {"blk.N.ffn_gate.weight [Q5_1]", "blk.N.nextn.eh_proj.weight [Q5_1]"}
+    assert "MTP block, used only for speculative decoding" in inspection.render(r)

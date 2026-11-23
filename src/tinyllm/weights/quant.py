@@ -78,21 +78,35 @@ def lookup(type_id: int) -> QuantType:
         raise ValueError(f"unknown GGML tensor type {type_id}") from None
 
 
-PACKED, DENSE_SMALL, GENERIC = "packed", "dense-small", "generic"
+PACKED, TINYLLM_Q4, TINYLLM_DENSE, DENSE_SMALL, GENERIC = (
+    "packed",
+    "tinyllm-q4",
+    "tinyllm-dense",
+    "dense-small",
+    "generic",
+)
 DENSE_SMALL_MAX_OUT = 2048
 
 
-def kernel_path(qtype: QuantType, out_features: int, in_features: int) -> str:
-    """Which amd_rdna kernel family a linear layer of this storage type and shape runs on.
+def kernel_path(qtype: QuantType, out_features: int, in_features: int, tinyllm: bool = True) -> str:
+    """Which AMD kernel family a linear layer of this storage type and shape runs on.
 
-    Mirrors `Linear.__call__` and `find_packed` in tinygrad/llm/kernels at the pinned commit:
-      packed       quantized weights multiplied in place; rows must be a multiple of 32 wide, and a
-                   multiple of 256 unless the type uses 32-weight blocks
-      dense-small  fp16 matrix-vector kernel for float weights with at most 2048 outputs (decode only)
-      generic      tinygrad's ordinary code generation on decoded weights: the slow path
+    Mirrors `Linear.__call__` and `find_packed` in tinygrad/llm/kernels at the pinned commit, plus the routing
+    of tinyllm's own kernels (tinyllm.tg.kernels) unless `tinyllm` is False:
+      packed         tinygrad: quantized weights multiplied in place; rows a multiple of 32 wide, and of 256
+                     unless the type uses 32-weight blocks
+      tinyllm-q4     tinyllm: Q4_0 and Q4_1, rows a multiple of 32 wide
+      tinyllm-dense  tinyllm: BF16 and F16, rows a multiple of 32 wide
+      dense-small    tinygrad: fp16 matrix-vector kernel for float weights with at most 2048 outputs
+      generic        tinygrad's ordinary code generation on decoded weights: the slow path
     """
     if qtype.packed_kernel and in_features % 32 == 0 and (qtype.small_block or in_features % 256 == 0):
         return PACKED
+    if tinyllm and in_features % 32 == 0:
+        if qtype.name in ("Q4_0", "Q4_1"):
+            return TINYLLM_Q4
+        if qtype.name in ("F16", "BF16"):
+            return TINYLLM_DENSE
     if qtype.name in ("F32", "F16", "BF16") and out_features <= DENSE_SMALL_MAX_OUT and in_features % 128 == 0:
         return DENSE_SMALL
     return GENERIC

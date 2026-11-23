@@ -103,10 +103,36 @@ def test_block_geometry_matches_ggml() -> None:
         ("Q4_K", 16, 288, quant.GENERIC),  # 256-weight blocks need rows that are a multiple of 256
         ("Q8_0", 16, 288, quant.PACKED),  # 32-weight blocks only need a multiple of 32
         ("Q5_1", 64, 256, quant.GENERIC),  # legacy type without a packed kernel
-        ("BF16", 1024, 5120, quant.DENSE_SMALL),
-        ("BF16", 248320, 5120, quant.GENERIC),  # the output head of the Q8_K_XL file
+        ("Q4_0", 17408, 5120, quant.TINYLLM_Q4),
+        ("Q4_1", 64, 288, quant.TINYLLM_Q4),
+        ("BF16", 1024, 5120, quant.TINYLLM_DENSE),
+        ("BF16", 248320, 5120, quant.TINYLLM_DENSE),  # the output head of the Q8_K_XL file
+        ("F16", 100, 64, quant.TINYLLM_DENSE),
+        ("F16", 100, 48, quant.GENERIC),  # rows must be a multiple of 32 wide
         ("F32", 48, 5120, quant.DENSE_SMALL),
     ],
 )
 def test_kernel_path(type_name: str, out: int, inp: int, expected: str) -> None:
     assert quant.kernel_path(quant.BY_NAME[type_name], out, inp) == expected
+
+
+def test_kernel_path_without_tinyllm_kernels() -> None:
+    assert quant.kernel_path(quant.BY_NAME["Q4_0"], 17408, 5120, tinyllm=False) == quant.GENERIC
+    assert quant.kernel_path(quant.BY_NAME["BF16"], 248320, 5120, tinyllm=False) == quant.GENERIC
+    assert quant.kernel_path(quant.BY_NAME["BF16"], 1024, 5120, tinyllm=False) == quant.DENSE_SMALL
+
+
+def test_header_only_accepts_a_truncated_file(tmp_path: Path) -> None:
+    path = write_gguf(
+        tmp_path / "m.gguf", {"general.architecture": "llama"}, [("w", (256, 8), "Q8_0")], truncate_data=10**9
+    )
+    with pytest.raises(gguf.GGUFError, match="extends past"):
+        gguf.read(path)
+    g = gguf.read(path, header_only=True)
+    assert [t.name for t in g.tensors] == ["w"] and g.tensors[0].nbytes == 8 * 34 * 8
+
+
+def test_header_only_reads_just_the_first_part(tmp_path: Path) -> None:
+    kv = {"general.architecture": "llama", "split.count": 2, "split.no": 0}
+    g = gguf.read(write_gguf(tmp_path / "m-00001-of-00002.gguf", kv, [("a", (32,), "F32")]), header_only=True)
+    assert len(g.parts) == 1 and [t.name for t in g.tensors] == ["a"]

@@ -27,7 +27,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     from tinyllm.weights.resolve import find_model
 
     store = None if args.store_gb is None else int(args.store_gb * 1e9)
-    r = inspection.report(find_model(args.model), args.ctx, args.slots, store)
+    r = inspection.report(find_model(args.model), args.ctx, args.slots, store, header_only=args.header_only)
     print(json.dumps(r, indent=2) if args.json else inspection.render(r))
     return 0 if (r["plan"] is None or r["plan"]["fits"] is not False) else 2
 
@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--store-gb", type=float, default=None, help="state store budget (default: one slot's worth per slot)"
     )
     sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.add_argument(
+        "--header-only",
+        action="store_true",
+        help="accept a file truncated after its header (tools/fetch_gguf_header.sh); first part only",
+    )
     sp.set_defaults(fn=_cmd_inspect)
 
     sp = sub.add_parser("device", help="show detected GPUs and the device tinyllm would use")
@@ -117,6 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
     op.add_argument("--server", help="llama-server binary (default: TINYLLM_REF_LLAMA_SERVER or .ref/llama.cpp)")
     op.add_argument("--threads", type=int, default=16)
     sp.set_defaults(fn=_cmd_oracle)
+
+    from tinyllm.server import serve
+
+    serve.add_parser(sub)
     return p
 
 

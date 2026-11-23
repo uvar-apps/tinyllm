@@ -3,9 +3,10 @@
 An OpenAI-compatible LLM server for quantized GGUF models, built on [tinygrad](https://github.com/tinygrad/tinygrad).
 First target: the Qwen3.8 family on AMD Strix Halo (`gfx1151`) under Linux.
 
-Status: **phase 0 complete** (foundations). There is no server yet. What exists is the tooling every later
-phase is measured against: model inspection, a benchmark harness with recorded baselines, and an
-oracle harness that checks outputs against tinygrad's own engine and against llama.cpp.
+Status: **phase 1** (single-stream server). `tinyllm serve` answers OpenAI's chat and completions APIs, with
+streaming, reasoning, tool calls, stop strings, seeds and logprobs, one request at a time. Below it sit the tools
+every phase is measured against: model inspection, a benchmark harness with recorded baselines, and an oracle
+harness that checks outputs against tinygrad's own engine and against llama.cpp.
 
 - [docs/01-research-findings.md](docs/01-research-findings.md): what was measured and why the design looks the way it does
 - [docs/02-design.md](docs/02-design.md): architecture and decisions
@@ -31,6 +32,44 @@ tools/build_ref_llamacpp.sh
 The first installs tinyllm with tinygrad pinned to an exact commit. The second downloads Qwen3.5-0.8B
 (same architecture as Qwen3.8-27B) in two quantizations, 1.4 GB together. The third builds a CPU-only
 llama.cpp used as an independent reference; it is optional.
+
+## Serving
+
+```bash
+uv run tinyllm serve Qwen3.8-27B-UD-Q4_K_XL.gguf --ctx 32768 --port 8000
+```
+
+It loads the model, compiles its programs (about 95 s for the 27B), and listens on
+`http://127.0.0.1:8000/v1` (`--host 0.0.0.0` to accept other machines, `--api-key` to require a bearer token).
+Routes: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics` (Prometheus).
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+reply = client.chat.completions.create(
+    model="Qwen3.8-27B",
+    messages=[{"role": "user", "content": "What is 17 * 23?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},  # Qwen3.8 thinks unless told not to
+)
+print(reply.choices[0].message.content)
+```
+
+- Chat prompts go through the model's own Jinja template, rendered in a sandbox. `chat_template_kwargs` and
+  `reasoning_effort` pass through to it.
+- Reasoning comes back as `reasoning_content`; tool calls as OpenAI `tool_calls`, with argument types taken from the
+  request's tool schemas.
+- Sampling: `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`,
+  `logit_bias`, `seed`, `logprobs` and `top_logprobs`. Unset values default to the model file's recommendation
+  (Qwen3.8: temperature 1.0, top-k 20, top-p 0.95).
+- One request runs at a time. Others wait, at most `--max-waiting` of them (16 by default); beyond that the server
+  answers 429. A client that disconnects cancels its request, and a request that extends the previous conversation
+  exactly reuses its state.
+- On Qwen3.8-27B `UD-Q4_K_XL`, decode runs at 12.5 tok/s and a long prompt prefills at about 317 tok/s. Greedy
+  decoding, and top-k up to 32 with temperature, top-p and min-p (Qwen3.8's defaults), sample inside the decode
+  program on the GPU; penalties, logit bias and other top-k values sample on the host, at about 12 tok/s.
+
+`tools/openai_sdk_check.py --base-url ...` runs the phase 1 checks against a running server.
 
 ## Commands
 
@@ -69,6 +108,43 @@ A model argument is a path, or a bare file name searched for under `~/.cache/mod
 down on a machine whose GPU also drives the screen; tinyllm refuses that configuration unless
 `TINYLLM_ALLOW_AMD_USERSPACE=1` is set.
 
+## Kernels
+
+tinyllm adds its own GPU kernels where tinygrad has no fast path (`src/tinyllm/tg/kernels/`):
+
+| Kernel | Weights | Qwen3.8-27B, tinygrad's path → tinyllm's |
+|--------|---------|--------------------------------------------------|
+| `dense` | BF16, F16 | BF16 file decode: 0.47 → 4.23 tok/s |
+| `dense_mm` | BF16, F16, prefill (multiples of 16 rows) | BF16 file prefill: 34.5 → 117.4 tok/s; UD-Q8_K_XL: 156 → 197 tok/s |
+| `q4` | Q4_0, Q4_1 | Q4_0 file decode: 4.62 → 13.58 tok/s |
+| `q45k` | Q4_K, Q5_K, prefill up to 32 rows | UD-Q4_K_XL: 20% less time in these layers, output bit-identical to tinygrad's |
+| `iq4xs` | IQ4_XS, prefill up to 32 rows | UD-Q4_K_XL: 18% less time in these layers, output bit-identical to tinygrad's |
+| `q6k` | Q6_K, prefill only | Q6_K file prefill: 123 → 162 tok/s (decode was already at the limit) |
+| `q8` | Q8_0, prefill only | Q8_0 file prefill: 131 → 210 tok/s (with fixed-length chunks, below) |
+
+They are on by default. `TINYLLM_KERNELS=none` (or a subset, such as `dense`) selects tinygrad's own paths for
+comparison. `tools/dense_kernel_check.py`, `tools/q4_kernel_check.py` and `tools/prefill_kernel_check.py` check them on
+the GPU; `tools/profile_step.py --set` compares kernel settings inside the model.
+
+The matrix-core kernels share one loop (`wmma.py`). `dense_mm` and `q8` reserve local memory they do not use, which
+lowers the occupancy the compiler schedules for; it then issues each step's loads at once instead of in rounds, and
+the BF16 kernel runs up to 3.4 times faster per layer (`densemm.py` has the details).
+
+On AMD, full prefill chunks also run through a program compiled for exactly the chunk size
+(`TINYLLM_STATIC_CHUNKS=0` turns this off). With a symbolic token count tinygrad runs some elementwise kernels, such as
+the feed-forward gate, several times slower. Prefill at chunk 32 / 128, tok/s, before fixed-length chunks, with
+them, and with the BF16 prefill kernel, the Q8_0 occupancy limit and a scheduling hint as well:
+
+| File | Before | Fixed-length chunks | Now |
+|------|--------|---------------------|-----|
+| `UD-Q4_K_XL` | 196.5 / 290.1 | 261.9 / 370.0 | 261.9 / 370.0 |
+| `UD-Q8_K_XL` | 141.9 / 204.7 | 156.4 / 237.4 | 196.3 / 348.6 |
+| `Q8_0` | 175.1 / 273.8 | 195.7 / 338.6 | 209.9 / 361.7 |
+| `BF16` | 34.5 / – | – | 117.4 / 233.2 |
+
+The cost is a second compiled program: the first prompt whose length is not a multiple of the chunk compiles the
+variable-length one on first use.
+
 ## Development
 
 ```bash
@@ -80,8 +156,10 @@ uv run pytest -m gpu
 ```
 
 The first runs on the CPU: unit tests, plus the development model through tinygrad's engine and against
-llama.cpp when those are installed (skipped otherwise). The second re-checks the stored GPU records and
-needs the AMD GPU and the models they were captured from.
+llama.cpp when those are installed (skipped otherwise); the server's tests drive it through the OpenAI SDK with a
+scripted model. The second re-checks the stored GPU records, checks the kernels, and serves the development model
+through the SDK; it needs the AMD GPU and the models the records were captured from.
 
-Layout: `src/tinyllm` (the package; only `tinyllm.tg` imports tinygrad), `tests` (with reference records in
-`tests/golden`), `bench/baselines` (recorded performance), `tools` (build, fetch and one-off measurement scripts).
+Layout: `src/tinyllm` (the package: `server`, `frontend`, `engine`, `runner`, `models`, `weights`, and `tg`, the only
+part that imports tinygrad), `tests` (with reference records in `tests/golden`), `bench/baselines` (recorded
+performance), `tools` (checks, build, fetch and one-off measurement scripts).

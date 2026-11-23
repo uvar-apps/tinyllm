@@ -193,7 +193,7 @@ What the `amd_rdna` pack does today, by regime:
 | small dense fp16/bf16 matrices | fp16 matrix-vector kernel | either |
 | anything else | generic graph on lazily decoded weights | slow path |
 
-Packed formats with native kernels: Q8_0, Q2_K to Q6_K, IQ1_S to IQ4_XS, IQ4_NL, MXFP4. That covers every quantized tensor in the Qwen3.8 files examined. Large F16/BF16 matrices (9% of the parameters in the `Q8_K_XL` file) currently take a generic path; a tuned dense kernel is a phase 4 item.
+Packed formats with native kernels: Q8_0, Q2_K to Q6_K, IQ1_S to IQ4_XS, IQ4_NL, MXFP4. Not covered: **Q4_0 and Q4_1**, and **float matrices with more than 2,048 outputs**, which take generic code generation. Those gaps hit two of the four priority formats. A plain Q4_0 file runs 89% of its weights on generic code. All of a BF16 file does, and so do the BF16 parts of mixed files: the output head of `UD-Q8_K_XL` reads at 9 GB/s and takes 62% of its decode step. Closing both gaps is phase 0B (research findings, section 5.5). Both gaps are closed by tinyllm's own kernels in `tinyllm.tg.kernels`, routed through a hook on tinygrad's `Linear` so they already serve the upstream engine of phases 0 and 1. `dense` reads BF16/F16 weights at the bandwidth limit for 1 to 8 rows, and `dense_mm` runs their prefill on the matrix cores. `q4` gives Q4_0/Q4_1 the integer-dot decode and matrix-core prefill paths that tinygrad has for its other formats. `q6k` and `q8` replace tinygrad's matrix-core prefill for Q6_K and Q8_0 with a loop that overlaps more loads (`wmma.py`) and a packed fp16 conversion; `q45k` and `iq4xs` do the same for Q4_K, Q5_K and IQ4_XS up to 32 rows. `TINYLLM_KERNELS` selects them.
 
 The roadmap for "the most advanced algorithms for 8, 6 and 4-bit execution" follows directly from F2 and F6:
 
@@ -352,9 +352,8 @@ The one disagreement on the 27B is a near-tie (0.17 logits between the first and
 
 **2. Where does the warm-up go, and does a pickled JIT remove it?** It is Python graph rewriting, done twice per program (first run, then JIT capture). On the 27B, with tinygrad's compile cache warm, the compiler did not run at all; 62% of profiled time was in `tinygrad.uop`, 25% in C calls (hashing, cache lookups), under 2% in code generation. A pickled JIT skips all of it: on the small model, start to first token fell from 16.6 s to 1.4 s with identical output. The pickle embeds every buffer including the weights (835 MB for a 0.8 GB model), so large models need the weights bound from the GGUF at load instead. That is plan item 2f.
 
-Open question remaining:
-
-3. Preferred HTTP stack. The plan assumes FastAPI and uvicorn at the edge, with the engine free of web dependencies.
+**3. Which HTTP stack?** FastAPI and uvicorn at the edge (decided 2026-11-23), on a thread of its own; the engine,
+runner and frontend import no web code. Jinja2 renders chat templates in its immutable sandbox.
 
 ## 11. Repository layout
 

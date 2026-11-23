@@ -12,6 +12,7 @@ Effort figures are rough estimates in focused engineer-weeks and exist only to s
 | Phase | Outcome | Size | Depends on |
 |-------|---------|------|------------|
 | 0 | Repository, pinned tinygrad, benchmark and oracle harness, recorded baselines | 1 | — |
+| 0B | Priority formats on gfx1151: 8, 6, 4 bit and BF16 all decode at the bandwidth limit | 2 to 3 | 0; can overlap with 1 |
 | 1 | Single-stream OpenAI server on the upstream engine, at parity with the tinygrad CLI | 2 | 0 |
 | 2 | Multi-sequence engine: continuous batching, slots, checkpoints, prefix reuse | 5 | 1 |
 | 3 | Speculative decoding: n-gram, MTP, DFlash2 | 4 | 2 |
@@ -22,9 +23,16 @@ Effort figures are rough estimates in focused engineer-weeks and exist only to s
 Milestones: **M1** after phase 1 (a usable daily server), **M2** after phase 2 (several users or agents at once),
 **M3** after phase 3 (fastest single-stream Qwen3.8-27B on this hardware).
 
-Reference numbers for every exit criterion: Qwen3.8-27B `UD-Q4_K_XL`, 4096 context, performance power profile,
-measured at 12.5 tok/s decode and 191 tok/s prefill with tinygrad's own settings (290 tok/s prefill in chunks of 128).
-The recorded baselines are in `bench/baselines/`.
+Priorities, in order: gfx1151 (Strix Halo) first. Other GPUs and the CPU come later, and CPU code paths exist only so
+tests run without a GPU.
+
+**Focus files** (decided 2026-11-22, after the Q8_0 prefill kernel): Qwen3.8-27B `UD-Q4_K_XL`, and for 8 bit
+`UD-Q8_K_XL` or plain `Q8_0`. Other quantizations (`Q4_K_M`, `Q4_0`, `Q6_K`, `BF16` files) keep their kernels,
+baselines and records but get no new work. Mixed files still depend on their member types: `UD-Q4_K_XL` is
+42% Q5_K, 22% IQ4_XS, 20% Q4_K and 13% Q6_K; `UD-Q8_K_XL` is 91% Q8_0 and 9% BF16.
+
+Reference numbers for every exit criterion: Qwen3.8-27B, 4096 context, performance power profile, the focus files
+(`bench/baselines/`, research findings section 5.5).
 
 ---
 
@@ -55,7 +63,7 @@ Exit criteria
 | Exit criterion | Result |
 |----------------|--------|
 | `tinyllm bench` reproduces the baseline within 3% | Matches tinygrad's own benchmark script: decode 12.53 tok/s against 12.46 to 12.53, prefill 198.3 tok/s against 198.3. A repeat run against the recorded baseline was within 0.7% on every metric. |
-| CI green without a GPU | The workflow is written but has not run on GitHub: there is no remote yet. Its commands pass locally with the device forced to the CPU: lint, types, 59 unit tests, and 6 tests that run the small model, including agreement with llama.cpp. |
+| CI green without a GPU | Superseded on 2026-11-23: there is no CI on GitHub (the workflow was removed and Actions are disabled on the repository). Everything is validated locally before pushing. In phase 0 the CPU checks passed locally with the device forced to the CPU: lint, types, 59 unit tests, and 6 tests that run the small model, including agreement with llama.cpp. |
 | Open questions answered | Design section 10, "Questions answered in phase 0". |
 
 What phase 0 found that changes later phases:
@@ -68,6 +76,84 @@ What phase 0 found that changes later phases:
 - **The `UD-Q8_K_XL` file keeps its output head and attention query weights in BF16**, 2.3 B parameters that miss the fast kernels. `tinyllm inspect` reports this for any file; it sharpens phase 4d.
 
 Not done in phase 0: a remote CI run, benchmarks of the Q5 and Q8 files, and a perplexity-scale accuracy measurement.
+
+## Phase 0B — Priority formats on gfx1151
+
+Purpose: every priority width decodes on Strix Halo at the memory-bandwidth limit, for one row and for a batch, before
+anything is built on top. Phase 0 found that only the K and Q8_0 formats are there today (research findings, 5.5).
+This phase touches kernels only, so it can run alongside phase 1.
+
+Scope since 2026-11-22: what remains is limited to the focus files. Items 1 to 4 below are done for all widths;
+item 5 now covers only the BF16 layers of `UD-Q8_K_XL`, and items 7 and 8 are new.
+
+Work
+
+1. **Per-width references.** For each of `Q8_0`, `Q6_K`, `Q4_K_M`, `Q4_0` and `BF16`: a benchmark baseline, a
+   per-kernel profile (`tools/profile_step.py`), an oracle record, and an agreement check against llama.cpp.
+2. **Dense BF16/F16 decode kernel** for large matrices, output head included, serving up to 8 rows in one pass over
+   the weights. Upstream's dense kernel handles at most 2,048 outputs and one row per pass; lifting only the size limit
+   already took `UD-Q8_K_XL` from 2.3 to 5.5 tok/s.
+3. **Q4_0 and Q4_1 packed-weight kernels**: the integer-dot decode path and the matrix-core prefill path, following the
+   structure of upstream's Q8_0 kernels. Without them a plain Q4_0 file runs 89% of its weights on generic code.
+4. **Q6_K prefill.** A dedicated matrix-core dequantizer for Q6_K, like upstream's for Q4_K and Q5_K. Q6_K now goes
+   through the generic byte-at-a-time one: 9.5 ms per billion weights per 32-token pass against 5.3 for Q4_K, so the
+   6-bit file prefills at 123 tok/s against 181 for Q4_K_M.
+5. **BF16 prefill** on the matrix cores, for the BF16 layers of `UD-Q8_K_XL`.
+6. Offer the kernels upstream.
+7. **Q8_0 prefill**, the same treatment as Q6_K: tinygrad's Q8_0 matrix-core kernel takes 85% of a 32-token pass of the
+   `Q8_0` file and 69% of the `UD-Q8_K_XL` one.
+8. **`UD-Q4_K_XL` prefill**: the same treatment for its Q4_K, Q5_K and IQ4_XS layers, whose tinygrad kernels take 66% of
+   a 32-token pass of that file.
+
+Exit criteria
+
+- One-row decode reads weights at 205 GB/s or more (95% of what the Q4 files reach today) for `Q8_0`, `Q6_K`,
+  `Q4_K_M`, `Q4_0`, `BF16` and `UD-Q8_K_XL`.
+- Eight-row decode at least 5 times one-row throughput for each of them.
+- Single-prompt prefill for `Q6_K`, `Q8_0` and `BF16` within 20% of `Q4_K_M`.
+- No main-block linear layer on the generic path in any of these files (`tinyllm inspect`).
+- Same greedy token as llama.cpp at 95% or more of positions for each file, with identical tokenization.
+
+**Status, 2026-11-22.** Numbers: research findings, section 5.5.
+
+- Item 1 is done for every file: baselines, profiles, reference records and llama.cpp agreement.
+- tinyllm's kernels are on by default; `TINYLLM_KERNELS=none` (or a subset such as `dense`) selects tinygrad's paths.
+- Item 2 is done: `src/tinyllm/tg/kernels/dense.py`.
+  `BF16` decodes at 4.23 tok/s and 220 GB/s (was 0.47), with 8 rows at 31.8 tok/s. `UD-Q8_K_XL` decodes at 7.35 tok/s
+  and 222 GB/s (was 2.00), with 8 rows at 49.2. Both agree with llama.cpp at 96 of 96 positions.
+- Item 3 is done: `src/tinyllm/tg/kernels/q4.py`. `Q4_0` decodes at 13.58 tok/s and 215 GB/s (was 4.62), with 8 rows
+  at 78.8 tok/s, and prefills at 190 tok/s (was 9.0). It agrees with llama.cpp at 95 of 96 positions.
+- Decode criteria (205 GB/s for one row, 8 rows at least 5 times one row) are now met by every file.
+- Item 4 is done: `src/tinyllm/tg/kernels/q6k.py`. `Q6_K` prefill 123.3 to 161.7 tok/s at chunk 32 and 208.5 to 251.9
+  at chunk 128; decode unchanged. The cause was memory latency in tinygrad's matrix-core loop, not the dequantizer.
+  The fix is several weight groups per loop step (`src/tinyllm/tg/kernels/wmma.py`) plus a packed fp16 conversion.
+- Item 7 is done: `src/tinyllm/tg/kernels/q8.py`. `Q8_0` prefill 130.8 to 175.2 tok/s at chunk 32 and 239.9 to 273.8
+  at chunk 128; `UD-Q8_K_XL` 113.1 to 142.6 and 185.9 to 204.7. Decode unchanged. Here packing the conversion mattered
+  more than overlapping loads.
+- Prefill criterion (within 20% of `Q4_K_M`, now 193 tok/s): met by `Q6_K` (162), `Q4_0` (190), `Q8_0` (210) and
+  `UD-Q8_K_XL` (197). `BF16` reaches 117 at chunk 32, where one chunk reads the 54.7 GB file at about 200 GB/s, so a
+  16-bit file cannot meet it at that chunk on this machine; it reaches 233 at chunk 128.
+- Item 8 is done: `src/tinyllm/tg/kernels/q45k.py` and `iq4xs.py`, 2 weight groups per loop step with tinygrad's own
+  arithmetic, so outputs stay bit-identical to tinygrad's. In the model they cut the time of the Q4_K and Q5_K layers by
+  20% and of the IQ4_XS layers by 18% at 32 rows; above 32 rows tinygrad's kernels stay, being as fast or faster there.
+  The same work found that tinygrad runs prefill elementwise kernels over a symbolic token count several times too slow;
+  full chunks now run through a fixed-length program on AMD (`TINYLLM_STATIC_CHUNKS`). Prefill at chunk 32 / 128:
+  `UD-Q4_K_XL` 196.5 / 290.1 to 261.9 / 370.0 tok/s, `UD-Q8_K_XL` 141.9 / 204.7 to 156.4 / 237.4, `Q8_0` 175.1 / 273.8
+  to 195.7 / 338.6. Decode unchanged. All reference records were re-captured; agreement with llama.cpp is unchanged.
+- Item 5 is done: `src/tinyllm/tg/kernels/densemm.py`, the bf16 matrix instruction on tinyllm's loop, for multiples of 16
+  rows. The same work found that reserving unused local memory per workgroup, which lowers the occupancy the compiler
+  schedules for, makes the loop up to 3.4 times faster per layer; tinyllm's Q8_0 kernel now reserves 24 KB (exact
+  as before). Prefill at chunk 32 / 128: `BF16` 34.5 to 117.4 / 233.2 tok/s, `UD-Q8_K_XL` 156.4 / 237.4 to
+  196.6 / 343.7, `Q8_0` 195.7 / 338.6 to 209.8 / 354.0. Decode unchanged. The `UD-Q8_K_XL` and `BF16` reference
+  records were re-captured (activations of BF16 layers are now rounded to bf16 in prefill); `UD-Q8_K_XL` agrees
+  with llama.cpp at 95 of 96 positions (was 96), the change being the near-tie where `Q8_0` already differs, and
+  `BF16` at 96 of 96 as before.
+- Prefill at 128 rows was re-measured with the occupancy lever: no further setting wins for any kernel (reservations
+  for Q4_K, Q5_K, IQ4_XS and Q6_K, tiles for Q8_0 and BF16), and the time splits into matrix instructions (54% of a
+  128-row Q5_K call), activation loads (16%) and weights (30%). A loop sharing activations in local memory and
+  loading weights a step ahead was then built and measured: no gain (next step 1). Of the compiler's scheduling
+  hints only its built-in strategy for matrix loops helped: the Q8_0 kernel uses it above 32 rows, chunk 128
+  `Q8_0` 354.0 to 361.7 tok/s and `UD-Q8_K_XL` 343.7 to 348.6.
 
 ## Phase 1 — Single-stream server (vertical slice)
 
@@ -92,6 +178,25 @@ Exit criteria
 - Prefill at least 270 tok/s for a single prompt.
 - Tokenizer output identical to the reference on the validation corpus.
 - Two simultaneous clients are served one after the other without errors; one-hour soak with no memory growth.
+
+**Status, 2026-11-23.** Built: `tinyllm serve` (`src/tinyllm/server/`), the engine loop (`engine/core.py`), the host
+sampler (`engine/sampling.py`), the frontend (`frontend/`: sandboxed templates, tokenizer protocol, detokenizer with
+stop strings, reasoning and tool-call routing), `UpstreamRunner` (`runner/`), `/metrics`, and the checks
+`tools/openai_sdk_check.py`, `tools/tokenizer_check.py` and `tools/soak.py`. Numbers: research findings, section 5.6.
+
+- Items 1 to 6 are done. Item 4's in-graph path covers greedy and top-k up to 32 with temperature, top-p and min-p
+  (`tinyllm.tg.sampler`); other settings sample on the host. Item 7: prefill runs in chunks of 128, four chunks queued per engine step between
+  cancellation checks. Item 8: the server waits with `tinyllm.tg.set_wait("yield")` (0.5 ms of polling, then 50 µs
+  sleeps), keeping fault detection and the timeout. Item 9: in-graph sampling returns 66 numbers instead of 1 MB of
+  logits, through GPU memory the host maps and accesses in place; the host path copies the logits into one array
+  without tinygrad's scheduler.
+- Met: the SDK checks against Qwen3.8-27B (`UD-Q4_K_XL`), decode (12.52 tok/s with sampling on the GPU; 11.95 with
+  the host sampler, as the CPU clocks down under the GPU load, section 5.6), prefill (317 tok/s), the tokenizer (38
+  of 38 texts), and two clients at once.
+- Soak (`tools/soak.py`, 55 minutes against the 27B with the host sampler, five minutes short of the criterion's
+  hour): 1,105 requests of five kinds, 221 of them streams abandoned and cancelled, none failed; server memory 784.4 MB
+  after warm-up and 785.5 MB at the end, flat from minute 9. With sampling on the GPU, 30 minutes: 625 requests,
+  none failed, server memory unchanged.
 
 ## Phase 2 — Multi-sequence engine
 
@@ -139,10 +244,10 @@ Purpose: the advanced-execution work for 8, 6 and 4-bit weights and BF16 (design
 
 Work
 
-- **4a. Tooling.** `tinyllm profile` (per-kernel time and bytes, AMD performance counters) and a benchmark matrix across file types: `UD-Q4_K_XL`, `UD-Q5_K_XL`, `UD-Q8_K_XL` (91% Q8_0, 9% BF16), plain `Q4_K_M`, `Q6_K`, `Q8_0`, `IQ4_XS`.
+- **4a. Tooling.** `tinyllm profile` (per-kernel time and bytes, AMD performance counters), growing out of `tools/profile_step.py`; the per-width benchmark matrix from phase 0B extended with `UD-Q5_K_XL` and `IQ4_XS`.
 - **4b. Prefill.** Autotuned tile and workgroup parameters for 40 compute units; the roughly 100 ms fixed cost per pass; fused feed-forward; integer matrix-core experiment; chunk-parallel DeltaNet scan if profiles justify it.
 - **4c. Decode.** Fused projections sharing one activation quantization; one-pass integer kernel extended to 16 rows.
-- **4d. Dense F16/BF16.** A tuned kernel for large unquantized matrices; native bf16 where available.
+- **4d. Dense F16/BF16.** Moved to phase 0B; what remains here is tuning it further with the autotuner.
 - **4e. Startup.** Parallel direct-I/O weight loading; investigation of zero-copy mapping on unified memory; load-time repack cache.
 - **4f. Long context.** 8-bit KV cache option; attention kernel behaviour beyond 100k tokens.
 - **4g. Qwen3.8-Flash-Next.** The `qwen4exp` architecture (512-expert MoE, indexer, compressed attention, host-mapped n-gram embeddings) on the slot engine.
@@ -151,7 +256,7 @@ Work
 Exit criteria
 
 - Prefill at least 350 tok/s for a single prompt.
-- Decode reads weights at 95% or more of measured machine bandwidth for the Q4, Q5, Q6 and Q8 files; the BF16-heavy file within 10% of its own ceiling.
+- Decode stays at the phase 0B bandwidth level for every priority width with the phase 4 fusions in place.
 - Start to ready under 15 s.
 - Flash-Next serves at least two concurrent streams.
 - The accuracy report is published in `docs/`.
@@ -184,18 +289,26 @@ Exit criteria: the same oracle and API test suites pass on each platform, with a
 - Every tinygrad bump is its own change, gated by the oracle and performance suites.
 - No performance claim without a committed benchmark JSON from the Strix machine.
 - Kernel changes that are not Strix-specific are offered upstream.
-- The integrated GPU drives the display: development and CI use the kernel-driver interface only.
+- The integrated GPU drives the display: development and tests use the kernel-driver interface only.
+- No CI on GitHub: lint, types, the CPU tests and the GPU tests (`uv run pytest -m gpu`) run on the Strix machine
+  before every push.
 
-## Immediate next steps (first working session)
+## Immediate next steps
 
-1. Initialise the repository and tooling (phase 0, items 1 and 2).
-2. Move the two research probes into `bench/` and turn them into `tinyllm inspect` and `tinyllm bench`.
-3. Download Qwen3.5-0.8B and stand up the oracle harness.
-4. Profile the warm-up to answer open question 2.
+1. Prefill at 128 tokens per call and more is at about 18 to 21 TFLOPS per kernel, against a matrix-instruction
+   floor of about 39. The loop that shares activations in local memory and loads weights a step ahead (`wmma.py`,
+   off by default) and LLVM's explicit scheduling hints all lost, for Q8_0 as for Q5_K; only the compiler's built-in
+   strategy (`iglp_opt(1)`) helped, by 1.5 to 2% for Q8_0 (research findings, section 5.5). What remains is
+   instruction-level code through tinygrad's AMD assembler backend: a large project, worth up to about 1.6 times on
+   these calls.
+2. ~~Warm-up for both prefill programs.~~ Done in phase 1 (`UpstreamRunner.warmup`, run by `tinyllm serve`).
+3. Start-up: compiling the 27B's programs takes 94 seconds; pickled programs with the weights bound from the GGUF at
+   load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
+   the chunk compiles the variable-length program on first use; the phase 1 server should compile both at start.
 
 ## Decisions wanted from you
 
 1. **Approach.** Confirm decision D1: reuse tinygrad's kernels and GGUF code, own the model graph and serving. The alternative of a pure wrapper is faster to M1 but cannot batch.
 2. **Order after phase 3.** Which comes first: Flash-Next support (4g), prefill speed (4b), structured output, or vision?
-3. **HTTP stack.** FastAPI and uvicorn at the edge, or standard library only as tinygrad does?
+3. ~~**HTTP stack.**~~ Decided 2026-11-23: FastAPI and uvicorn.
 4. **Other hardware.** Which NVIDIA or discrete AMD machine, if any, is available for phase 6.

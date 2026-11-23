@@ -94,6 +94,8 @@ def run(case: Case) -> dict[str, Any]:
             "gb_s": decode_bytes / 1e9 / (d["median_ms"] / 1e3),
         },
         "device": tg.device_info(),
+        "kernels": list(session.kernels),
+        "static_chunks": session.static_chunks,
         "tinygrad_rev": tg.TINYGRAD_REV,
     }
 

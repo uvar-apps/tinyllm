@@ -7,6 +7,8 @@ tinygrad through the names re-exported here, so a tinygrad bump touches one pack
 
 from __future__ import annotations
 
+import time
+import types
 from typing import Any
 
 from tinyllm import device as _device
@@ -16,10 +18,13 @@ DEV: str = _device.configure()
 TINYGRAD_REV: str | None = _pin.check()
 
 from tinygrad import Device, GlobalCounters, Tensor, TinyJit, UOp, dtypes, nn  # noqa: E402
+from tinygrad.device import Buffer, BufferSpec  # noqa: E402
 
 __all__ = [
     "DEV",
     "TINYGRAD_REV",
+    "Buffer",
+    "BufferSpec",
     "Device",
     "GlobalCounters",
     "Tensor",
@@ -30,6 +35,7 @@ __all__ = [
     "dtypes",
     "nn",
     "set_polling_wait",
+    "set_wait",
     "synchronize",
 ]
 
@@ -57,6 +63,55 @@ def set_polling_wait(enabled: bool = True) -> None:
     default = getattr(type(dev), "sleep_timeout_ms", None)
     if default is not None:
         dev.sleep_timeout_ms = None if enabled else default
+
+
+YIELD_SPIN_SECONDS = 0.0005  # a "yield" wait polls without pause this long after the last progress, then sleeps
+YIELD_SLEEP_SECONDS = 0.00005
+
+
+def _yielding_wait(self: Any, sig: Any, value: int, timeout: int | None = None) -> None:
+    """tinygrad's HCQ signal wait (`HCQCompiled._wait_signal` at the pinned commit) with short sleeps.
+
+    The stock loop polls in Python and holds the interpreter lock for the whole wait, so another Python thread (the
+    HTTP server) can only run when the interpreter forces a switch, every 5 ms. This one polls for
+    YIELD_SPIN_SECONDS and then sleeps in YIELD_SLEEP_SECONDS steps, releasing the lock; completion is seen within
+    about 0.1 ms. Timeout and fault detection are unchanged.
+    """
+    timeout = timeout if timeout is not None and self.can_recover else None
+    limit = (timeout or self.wait_timeout_ms) / 1000
+    start, done, err = time.perf_counter(), sig[0], self.error_state.host.view(fmt="q")
+    while done < value and not err[0]:
+        if done != (done := sig[0]):
+            start = time.perf_counter()
+            continue
+        elapsed = time.perf_counter() - start
+        if elapsed > limit:
+            raise RuntimeError(f"{self.device} signal wait timed out")
+        if elapsed > YIELD_SPIN_SECONDS:
+            time.sleep(YIELD_SLEEP_SECONDS)
+    if err[0]:
+        raise RuntimeError(f"{self.device} failed with {err[0]}")
+
+
+def set_wait(mode: str) -> None:
+    """How the host waits for the GPU (plan, phase 1 item 8):
+
+    "poll"   poll only (`set_polling_wait`): lowest latency; holds the interpreter lock and one CPU core.
+    "yield"  poll briefly, then sleep in 50 microsecond steps: for the server, where an HTTP thread shares the
+             interpreter; costs at most about 0.1 ms per wait.
+    "sleep"  tinygrad's own: poll for 200 ms, then sleep on a kernel event that on Strix Halo only wakes the
+             waiter every 208 ms (docs/01-research-findings.md, section 5.3). Benchmarks must not use it.
+    """
+    dev = Device[Device.DEFAULT]
+    if not hasattr(dev, "_wait_signal"):
+        return  # not an HCQ device (the CPU in tests): nothing to change
+    if mode not in ("poll", "yield", "sleep"):
+        raise ValueError(f"unknown wait mode {mode!r}")
+    set_polling_wait(mode != "sleep")
+    if mode == "yield":
+        dev._wait_signal = types.MethodType(_yielding_wait, dev)
+    else:
+        dev.__dict__.pop("_wait_signal", None)  # back to the class's own loop
 
 
 def device_info() -> dict[str, Any]:

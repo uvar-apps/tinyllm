@@ -104,6 +104,15 @@ def test_amd_golden(golden: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr[-2000:]
 
 
+@pytest.mark.gpu
+def test_fixed_length_chunks_match_variable_length() -> None:
+    """Full prefill chunks through their own program, the partial last one through the shared one (2.5 chunks)."""
+    cmd = [sys.executable, "tools/static_chunk_check.py", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf", "--chunk", "16"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, timeout=900, env=_gpu_env())
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-2000:]
+    assert proc.stdout.count("same greedy token: True") == 5
+
+
 def _gpu_env() -> dict[str, str]:
     import os
 
