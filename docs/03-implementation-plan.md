@@ -252,8 +252,12 @@ draft, and gives the same tokens as plain decoding.
   27.6 tok/s greedy and 25.0 seeded, against 12.5 without speculation; `UD-Q8_K_XL` goes from 7.4 to 18.7.
 - Served by default (`tinyllm serve --speculative K`, 3 when the GGUF has an MTP block): the SDK checks pass, and
   a 30-minute soak ran 878 requests without a failure or memory growth.
-- Not yet: 3b (n-gram), 3d (DFlash2), adaptive draft length (per-prompt best K would add about 5%), and the
-  multi-stream criterion, which needs phase 2.
+- 3d (DFlash2) built 2026-11-24 (`tinyllm.tg.dflash`, `tinyllm serve --draft-model`; research findings, section
+  5.8): 31.4 tok/s greedy over the five prompts against 27.6 with MTP, 49.5 on code and 53.3 on the reasoning
+  prompt, output identical to plain decoding. Below the 35 tok/s stretch goal on average; its cycle is spent in the
+  8-row verify (110 of 123 ms).
+- Not yet: 3b (n-gram), adaptive draft length (per-prompt best K would add about 5% for MTP), rejection sampling
+  against the drafter's distribution for sampled requests, and the multi-stream criterion, which needs phase 2.
 
 ## Phase 4 — Strix Halo optimisation and quantization coverage
 

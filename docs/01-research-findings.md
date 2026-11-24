@@ -449,6 +449,31 @@ The drafts' argmax over 248,320 logits went through tinygrad's generic reduction
 
 **Through the server.** `tinyllm serve` turns speculation on by default when the GGUF has an MTP block (`--speculative K`, 0 for off). The OpenAI SDK checks (`tools/openai_sdk_check.py`) all pass with it: streaming, reasoning on and off, stop sequences, seeds, a tool-call round trip, two clients at once. The speed check's long story, sampled at Qwen3.8's defaults (temperature 1, top-k 20, top-p 0.95), streams at 18.9 tok/s, the hardest case of the table above; short chat answers in the same run stream at 26 to 38 tok/s. Prefill of the 6,412-token prompt runs at 311 tok/s against 317 without the MTP block, which now also runs over every prompt chunk to fill its own KV cache. Start-up: 19 s to load and 138 s to compile. Soak (`tools/soak.py`, 30 minutes): 878 requests of five kinds, 175 of them streams abandoned and cancelled, none failed; server memory 1,598.8 MB after warm-up and 1,604.6 MB at the end, flat over the last ten minutes (1.3 GB without speculation); 68% of 19,578 drafts accepted.
 
+### 5.8 Speculative decoding with DFlash2 (phase 3)
+
+DFlash2 (`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, architecture `dflash`, 1.1 GB) is a separate drafter that proposes a block of seven tokens in one pass, where the MTP block needs one pass of itself and of the output head per draft. Five layers of width 5,120 (32 query and 8 KV heads of 128, a SiLU FFN of 17,408), non-causal attention within a 2,048-token window, and around attention and around the FFN a depthwise convolution over the block (kernel 2) whose weights come per token from a projection plus a static base. It borrows the target's token embedding (the mask token is 248070) and output head. Its context is the target's own residual stream: the inputs of target layers 6, 20, 34, 48 and 62, concatenated (25,600 numbers per token), fused by `fc` and a norm, become keys and values in the drafter's cache at each processed token's position. A selector then walks the block: the head's 16 best tokens at each position, scored as the logit plus a rank-256 bilinear term between the previous position's choice and this one's (`selector_predecessor` and `selector_successor` codebooks, gated by the hidden state), picked greedily from the anchor. `tinyllm.tg.dflash`, after llama.cpp's `src/models/dflash.cpp`, `dflash2.cpp` and its driver; `tests/test_dflash.py` checks the convolution and the walk against NumPy models of those, and the attention window.
+
+In tinyllm a DFlash2 cycle is one captured program with one position variable: the block [last token, 7 masks] drafts at the next positions, the main model verifies the 8 rows (the same bit-exact verify as for MTP), and the verified rows' layer inputs are injected for the next block; rejected rows' entries are overwritten by the next block. Prefill and one-token decode programs inject too, so the drafter's context always covers what the main model has processed.
+
+**Acceptance.** Teacher-forced over greedy outputs (`tools/dflash_check.py`): 6.56 tokens per block on the code prompt (5.56 of 7 drafts) and 2.99 on the child's explanation, against 3.70 and 2.83 for the MTP at K = 3.
+
+**Speed, `UD-Q4_K_XL`, K = 7** (`tools/spec_check.py --drafter --seeded`, 256 tokens, output identical to plain decoding on every row, greedy and seeded; MTP at K = 3 for comparison):
+
+| Prompt | Greedy tok/s | Tokens per cycle | MTP greedy | Seeded tok/s | Tokens per cycle | MTP seeded |
+|--------|--------------|------------------|------------|--------------|------------------|------------|
+| Python function with tests | 49.5 | 6.07 | 34.9 | 33.8 | 4.18 | 28.8 |
+| How a refrigerator works, for a child | 25.0 | 3.07 | 26.6 | 22.9 | 2.83 | 22.7 |
+| TCP and UDP, table and summary | 31.4 | 3.86 | 27.5 | 30.3 | 3.75 | 26.8 |
+| Short story | 20.7 | 2.55 | 20.7 | 18.3 | 2.26 | 19.0 |
+| Train timetable puzzle, thinking on | 53.3 | 6.54 | 33.3 | 44.0 | 5.43 | 32.3 |
+| All five | 31.4 | | 27.6 | 27.2 | | 25.0 |
+
+A cycle takes about 123 ms whatever is accepted. Profiled (`tools/profile_step.py --kind speculate7 --drafter`): 16 ms of drafting, of which the drafter's weights take 4.4 ms and the Q4_0 head 3.5 ms (both at the bandwidth limit) and the rest generic code (the convolutions, the windowed attention, the selector); 110 ms for the 8-row verify and the injection. The verify is where the time is: 80 ms for one row, and at 8 rows the Q5_K decode kernel runs about a quarter above its bandwidth time (it is 42% of the file), while the bit-exact per-row work adds about 7,400 small kernels. For text the drafter predicts poorly the 8-row verify costs more than the MTP's 4-row one and gains nothing; a narrower verify saves little, because most of a cycle's cost does not depend on its width.
+
+Through the server (`tinyllm serve --draft-model`) the OpenAI SDK checks all pass; prefill runs at 316 tok/s, as without a drafter (injecting the features costs less than the MTP's extra pass), and start-up compiles for 170 s. The speed check's long story, sampled at Qwen3.8's defaults, streams at 16.9 tok/s against 18.9 with the MTP block: DFlash2 is the better drafter for code, structured text and reasoning, the MTP block for sampled prose, and it needs no second file, so it stays the default.
+
+Gufo's published DFlash2 rows for the same files on this machine (one 128-token request per prompt, greedy, thinking off) land in the same place: 50.3 tok/s on a C++ ring buffer, 46.9 on the train puzzle, 22.8 to 28.0 on creative, Chinese, Italian and instruction prompts; its 71.55 tok/s headline is a prompt that repeats a word, where all seven drafts always hold.
+
 ## 6. External baselines (published, not reproduced here)
 
 llama.cpp, Qwen3.8-27B on Strix Halo:

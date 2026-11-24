@@ -25,6 +25,7 @@ def sampling_defaults(kv: dict[str, Any]) -> dict[str, float]:
 
 
 DEFAULT_DRAFTS = 3  # MTP drafts per speculative cycle (docs/01-research-findings.md, section 5.7)
+DFLASH_DRAFTS = 7  # DFlash2 drafts per cycle: its whole block
 
 
 def has_mtp(path: Path) -> bool:
@@ -52,13 +53,16 @@ def main(args: argparse.Namespace) -> int:
 
     path = find_model(args.model)
     start = time.perf_counter()
-    k = args.speculative if args.speculative is not None else DEFAULT_DRAFTS if has_mtp(path) else 0
-    runner = UpstreamRunner(path, args.ctx, chunk=args.chunk, speculative=k)
+    drafter = Path(args.draft_model).expanduser() if args.draft_model else None
+    default = (DFLASH_DRAFTS if drafter else DEFAULT_DRAFTS) if drafter or has_mtp(path) else 0
+    k = args.speculative if args.speculative is not None else default
+    runner = UpstreamRunner(path, args.ctx, chunk=args.chunk, speculative=k, drafter=drafter if k else None)
     tokenizer = GGUFTokenizer(runner.kv)
     template = None
     if tokenizer.chat_template and not args.no_chat_template:
         template = ChatTemplate(tokenizer.chat_template, tokenizer.bos_token, tokenizer.eos_token)
-    drafting = f", {runner.speculative} MTP drafts per step" if runner.speculative else ""
+    kind = "DFlash2" if drafter else "MTP"
+    drafting = f", {runner.speculative} {kind} drafts per step" if runner.speculative else ""
     log.info("loaded %s in %.1fs%s; compiling", path.name, time.perf_counter() - start, drafting)
     runner.warmup()
     log.info("compiled in %.1fs", runner.warmup_seconds)
@@ -105,7 +109,13 @@ def add_parser(sub: Any) -> None:
         type=int,
         default=None,
         metavar="K",
-        help=f"MTP drafts per decode step, 0 to turn speculative decoding off "
-        f"(default: {DEFAULT_DRAFTS} when the model has an MTP block)",
+        help=f"drafts per decode step, 0 to turn speculative decoding off (default: {DFLASH_DRAFTS} with "
+        f"--draft-model, else {DEFAULT_DRAFTS} when the model has an MTP block)",
+    )
+    sp.add_argument(
+        "--draft-model",
+        default=None,
+        metavar="GGUF",
+        help="a DFlash2 drafter (e.g. Qwen3.8-27B-DFlash2-Q4_K_M.gguf) instead of the model's own MTP block",
     )
     sp.set_defaults(fn=main)

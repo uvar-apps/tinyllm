@@ -40,6 +40,7 @@ from tinyllm.tg import (
 from tinyllm.tg import kernels as tl_kernels
 from tinyllm.tg import mtp as tl_mtp
 from tinyllm.tg import speculative as spec
+from tinyllm.tg.dflash import DFlash
 from tinyllm.tg.kernels.topk import topk
 from tinyllm.tg.sampler import OUTPUT, PARAMS, sample_row
 
@@ -59,20 +60,27 @@ class _LogitsTransformer(Transformer):  # type: ignore[misc]
     logits equals upstream's own greedy token.
     """
 
+    taps: Any = None  # (layer indices, inject) when a DFlash2 drafter reads the inputs of those layers
+
     def forward(self, tokens: Any, temperature: Any, *start_pos: Any) -> Any:
         x = self.token_embd(t := tokens.to(self.token_embd.weight.device)).float()
         if (hc := self.config.hc) is not None:
             x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
         elif self.config.attn_res_block_size:
             x = x.unsqueeze(2)
-        idx_mask = None
-        for block in self.blk:
+        idx_mask, features = None, []
+        for i, block in enumerate(self.blk):
+            if self.taps is not None and i in self.taps[0]:
+                features.append(x)
             x, idx_mask = block(x, start_pos, idx_mask, t)
         if hc is not None:
             x = self.output_hc.mix(x)[0] if hasattr(self, "output_hc") else x.mean(2)
         elif self.config.attn_res_block_size:
             x = self.output_res_score.mix(x)
-        return self.output(self.output_norm(x[:, -1:]))[:, -1, :].float().to(tokens.device)
+        logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].float().to(tokens.device)
+        if self.taps is not None:
+            Tensor.realize(logits, self.taps[1](features[0].cat(*features[1:], dim=-1), start_pos[0]))
+        return logits
 
 
 def _mapped(n: int) -> tuple[Any, Any]:
@@ -117,6 +125,7 @@ class UpstreamSession:
         kernels: bool | None = None,
         static_chunks: bool | None = None,
         speculative: int = 0,
+        drafter: str | Path | None = None,
     ) -> None:
         self.rows, self.chunk, self.logits = rows, chunk, logits
         set_polling_wait(polling_wait)
@@ -128,17 +137,25 @@ class UpstreamSession:
         # off the AMD kernel path upstream re-decodes the packed weights on every call unless they are realized
         if realize is None:
             realize = not default_device().startswith("AMD")
-        self.mtp: Any = None
+        self.mtp: Any = None  # the MTP block, when it drafts
+        self.dflash: Any = None  # the DFlash2 drafter, when it drafts
         if speculative:
             if not logits or rows != 1:
                 raise ValueError("speculative decoding needs a one-row session in logits mode")
-            self.model, self.kv, self.mtp = tl_mtp.load(str(model_path), max_context, realize)
-            if self.mtp is None:
-                raise ValueError(f"{model_path} has no MTP block to draft with")
+            if drafter is None:
+                self.model, self.kv, self.mtp = tl_mtp.load(str(model_path), max_context, realize)
+                if self.mtp is None:
+                    raise ValueError(f"{model_path} has no MTP block to draft with")
+            else:
+                self.model, self.kv = Transformer.from_gguf(str(model_path), max_context, realize=realize)
+                self.dflash = DFlash.load(drafter, int(self.model.max_context))
+                if speculative >= self.dflash.block_size:
+                    raise ValueError(f"DFlash2 drafts at most {self.dflash.block_size - 1} tokens per block")
         else:
             self.model, self.kv = Transformer.from_gguf(str(model_path), max_context, realize=realize)
-        self.speculative = speculative if self.mtp is not None else 0  # K, the drafts per cycle
-        forward = self._prefill_mtp if self.mtp is not None else None
+        drafting = self.mtp is not None or self.dflash is not None
+        self.speculative = speculative if drafting else 0  # K, the drafts per cycle
+        forward = self._prefill_mtp if self.mtp is not None else self._prefill_dflash if self.dflash else None
         if logits:
             self.model.__class__ = _LogitsTransformer
             self.model.prefill_jit = TinyJit(forward or self.model.forward)
@@ -167,7 +184,7 @@ class UpstreamSession:
         self.reuse_logits = False
         self.pos = 0
         self.trace: list[StepRecord] = []
-        if self.mtp is not None:
+        if self.speculative:
             self._init_speculative()
 
     def tokenizer(self) -> Any:
@@ -176,7 +193,7 @@ class UpstreamSession:
     def reset(self) -> None:
         """Start over at position 0. Upstream clears recurrent state itself when a call starts there."""
         self.pos, self._sampled = 0, None
-        if self.mtp is not None:
+        if self.speculative:
             self._restore_row, self._spec_prev = None, None
 
     # ---- speculative decoding (tinyllm.tg.speculative) ----
@@ -197,23 +214,66 @@ class UpstreamSession:
         self._verify_blocks = [*self._recurrent, *spec.attention_blocks(self.model)]
         for b in self._recurrent:
             b.allocate(k + 1, default_device())
-        # the main model's output-normed hidden at each row of the last verify (after a prefill: its last row)
-        self._vh = Tensor.zeros(1, k + 1, cfg.dim).contiguous().realize()
-        self._spec_io = (_mapped(k + 2 + (k + 1) * PARAMS), _mapped((k + 1) * OUTPUT + 1))
-        self._mtp_tokens = np.zeros(k + 1, dtype=np.float32)  # the tokens the main model chose at those rows
-        self._cycle_jit = TinyJit(self._cycle)
+        if self.dflash is not None:
+            # every row the main model processes hands its layer inputs to the drafter (`_LogitsTransformer.taps`)
+            self.model.taps = (frozenset(self.dflash.target_layers), self._inject)
+            self._spec_io = (_mapped(1 + (k + 1) * PARAMS), _mapped((k + 1) * OUTPUT + 1))
+            self._cycle_jit = TinyJit(self._cycle_dflash)
+        else:
+            # the main model's output-normed hidden at each row of the last verify (after a prefill: its last row)
+            self._vh = Tensor.zeros(1, k + 1, cfg.dim).contiguous().realize()
+            self._spec_io = (_mapped(k + 2 + (k + 1) * PARAMS), _mapped((k + 1) * OUTPUT + 1))
+            self._mtp_tokens = np.zeros(k + 1, dtype=np.float32)  # the tokens the main model chose at those rows
+            self._cycle_jit = TinyJit(self._cycle)
         self._restore_jits = [TinyJit(functools.partial(self._restore, n)) for n in range(k)]
         self._v_prev = UOp.variable("spec_prev", 0, self.max_context - 1)
         self._v_row = UOp.variable("spec_row", 0, k)
         self._v_verify = UOp.variable("spec_pos", 1, self.max_context - 1)
         self._restore_row, self._spec_prev = None, None
 
-    def _blocks(self, tokens: Any, start_pos: tuple[Any, ...]) -> Any:
-        """The main model's layers and output norm over `tokens` (1, T): the hidden of every row."""
+    def _blocks(self, tokens: Any, start_pos: tuple[Any, ...], features: list[Any] | None = None) -> Any:
+        """The main model's layers and output norm over `tokens` (1, T): the hidden of every row. With `features`,
+        the inputs of the DFlash2 drafter's target layers are appended to it."""
         x = self.model.token_embd(tokens).float()
-        for block in self.model.blk:
+        taps = self.dflash.target_layers if features is not None else ()
+        for i, block in enumerate(self.model.blk):
+            if i in taps:
+                features.append(x)  # type: ignore[union-attr]
             x, _ = block(x, start_pos, None, tokens)
         return self.model.output_norm(x)
+
+    def _inject(self, features: Any, start: Any) -> Any:
+        """The drafter's KV for rows whose target-layer inputs are `features`, from position `start` on."""
+        stores = self.dflash.inject(features, start)
+        return Tensor(self.dflash.cache[0].uop.after(*stores))
+
+    def _prefill_dflash(self, tokens: Any, following: Any, temperature: Any, *start_pos: Any) -> Any:
+        """A prefill call that also writes the DFlash2 drafter's KV for these rows (`following` is not needed)."""
+        features: list[Any] = []
+        h = self._blocks(tokens, start_pos, features)
+        logits = self.model.output(h[:, -1:])[:, -1, :].float()
+        Tensor.realize(logits, self._inject(features[0].cat(*features[1:], dim=-1), start_pos[0]))
+        return logits
+
+    def _cycle_dflash(self, io_in: Any, io_out: Any, pos: Any) -> Any:
+        """Draft a block with DFlash2 at `pos`, verify it, and inject the verified rows for the next block."""
+        k, model, dflash = self.speculative, self.model, self.dflash
+        last = io_in[0:1].cast(dtypes.int32).reshape(1, 1)
+        params = io_in[1:].reshape(k + 1, PARAMS)
+        block = last.cat(Tensor.full((1, k), dflash.mask_token, dtype=dtypes.int32), dim=1)
+        hidden = dflash.hidden(model, block, pos)[0, 1:]
+        drafts = dflash.select(hidden, self._draft_head(hidden).float(), last.reshape(1))
+        drafts.realize()  # the block's KV entries are overwritten by the injection below
+        verify = last.cat(drafts, dim=1)
+        features: list[Any] = []
+        with spec.recording(self._verify_blocks):
+            h = self._blocks(verify, (pos,), features)
+        logits = model.output(h).float()[0]
+        rows = Tensor.stack(*(sample_row(logits[j], params[j]) for j in range(k + 1)))
+        n = spec.leading_matches(rows[:, 0], verify[0, 1:].float())
+        out = io_out.assign(rows.flatten().cat(n.float().reshape(1)))
+        Tensor.realize(out, self._inject(features[0].cat(*features[1:], dim=-1), pos))
+        return out
 
     def _prefill_mtp(self, tokens: Any, following: Any, temperature: Any, *start_pos: Any) -> Any:
         """A prefill call that also writes the MTP block's KV for these rows (each row's hidden paired with the
@@ -259,14 +319,14 @@ class UpstreamSession:
 
     def _settle(self) -> None:
         """Put back the recurrent state a partly rejected verify left, before anything else runs."""
-        if self.mtp is not None and self._restore_row is not None:
+        if self.speculative and self._restore_row is not None:
             self._restore_jits[self._restore_row]()
             self._restore_row = None
 
     def _after_plain_step(self) -> None:
         """A one-token call without the MTP: drafting can resume after it, from a hidden that is one call old
         (the first draft of the next cycle is then likely rejected; the output is unaffected)."""
-        if self.mtp is not None:
+        if self.speculative:
             self._spec_prev = (self.pos, 0)
 
     def speculate(self, token: int, params: Any) -> tuple[Any, int]:
@@ -286,16 +346,23 @@ class UpstreamSession:
         self._settle()
         prev, row = self._spec_prev
         (io_in, in_view), (io_out, out_view) = self._spec_io
-        self._mtp_tokens[row] = token
-        in_view[: k + 1] = self._mtp_tokens
-        in_view[k + 1] = float(token)
-        in_view[k + 2 :] = np.asarray(params, dtype=np.float32).reshape(-1)
-        b = self._v_prev.bind(prev), self._v_row.bind(row), self._v_verify.bind(self.pos)
-        self._cycle_jit(io_in, io_out, *b)
+        settings = np.asarray(params, dtype=np.float32).reshape(-1)
+        if self.dflash is not None:
+            in_view[0] = float(token)
+            in_view[1:] = settings
+            self._cycle_jit(io_in, io_out, self._v_verify.bind(self.pos))
+        else:
+            self._mtp_tokens[row] = token
+            in_view[: k + 1] = self._mtp_tokens
+            in_view[k + 1] = float(token)
+            in_view[k + 2 :] = settings
+            b = self._v_prev.bind(prev), self._v_row.bind(row), self._v_verify.bind(self.pos)
+            self._cycle_jit(io_in, io_out, *b)
         synchronize()
         n = int(out_view[-1])
         rows = out_view[:-1].reshape(k + 1, OUTPUT)
-        self._mtp_tokens[:] = rows[:, 0]
+        if self.dflash is None:
+            self._mtp_tokens[:] = rows[:, 0]
         self._spec_prev = (self.pos, n)
         self._restore_row = n if n < k else None
         self.pos += n + 1
@@ -307,8 +374,8 @@ class UpstreamSession:
         """Queue one model call and return its output tensor without waiting for the device."""
         self._settle()
         full = isinstance(tokens.shape[1], int) and tokens.shape[1] == self.chunk
-        if self.mtp is not None:
-            if following is None:  # the prefill programs of a speculative session also fill the MTP's KV
+        if self.speculative:
+            if following is None:  # the prefill programs of a speculative session also fill the drafter's KV
                 raise ValueError("a speculative session's prefill calls need the following tokens")
             jit = self._static_jit if self._static_jit is not None and full else self.model.prefill_jit
             name = "start_pos_0" if jit is self._static_jit else "start_pos"
@@ -377,7 +444,7 @@ class UpstreamSession:
         buf[:, self.pos : end] = np.asarray(tokens, dtype=np.int32)
         table = Tensor(buf)
         nxt = None
-        if self.mtp is not None:  # the same table shifted by one: row i holds the token at i + 1
+        if self.speculative:  # the same table shifted by one: row i holds the token at i + 1
             shifted = np.zeros_like(buf)
             shifted[:, :-1] = buf[:, 1:]
             if following is not None:

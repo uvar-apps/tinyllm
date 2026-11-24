@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -44,6 +45,7 @@ def main() -> int:
     ap.add_argument("--prompts", type=int, default=len(PROMPTS))
     ap.add_argument("--seeded", action="store_true")
     ap.add_argument("--spec-only", action="store_true", help="skip the plain runs (speed only, no comparison)")
+    ap.add_argument("--drafter", default=None, help="a DFlash2 GGUF instead of the model's MTP block")
     args = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]  # progress shows up in a log file
 
@@ -52,7 +54,8 @@ def main() -> int:
     from tinyllm.tg.tokenizer import GGUFTokenizer
 
     start = time.perf_counter()
-    runner = UpstreamRunner(args.model, max_context=4096, wait="poll", speculative=args.k)
+    drafter = None if args.drafter is None else Path(args.drafter).expanduser()
+    runner = UpstreamRunner(args.model, max_context=4096, wait="poll", speculative=args.k, drafter=drafter)
     tok = GGUFTokenizer(runner.kv)
     runner.warmup()
     print(f"loaded and compiled in {time.perf_counter() - start:.0f} s, K = {runner.speculative}")

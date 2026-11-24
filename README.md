@@ -72,7 +72,9 @@ print(reply.choices[0].message.content)
 
 - Speculative decoding (`--speculative K`, default 3 when the GGUF has an MTP block, 0 turns it off): each step
   drafts K tokens with Qwen3.8's built-in MTP block and verifies them in one pass of the main model, which samples
-  every position itself. Output is the same as without speculation, token for token, greedy or seeded: the verify
+  every position itself. `--draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf` drafts with DFlash2 instead, seven tokens
+  per step from one pass of a 1.1 GB drafter: on the 27B about 50 tok/s on code and reasoning, 31 on average over
+  mixed prompts, against 35 and 28 with the MTP block (research findings, sections 5.7 and 5.8). Output is the same as without speculation, token for token, greedy or seeded: the verify
   computes bit for bit what one-token decoding computes (`tools/rollback_check.py`). Drafts use a Q4_0 copy of the
   output head made at load (`TINYLLM_DRAFT_HEAD=output` uses the model's own; `q4:98304` keeps only the first
   98,304 tokens, faster for English and code, poor for other languages). Requests that sample on the host decode

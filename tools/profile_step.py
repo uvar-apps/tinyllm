@@ -40,8 +40,10 @@ for setting in sys.argv[5:]:  # module.NAME=value, applied to tinyllm.tg.kernels
     target, value = setting.split("=", 1)
     module, name = target.rsplit(".", 1)
     setattr(importlib.import_module(f"tinyllm.tg.kernels.{module}"), name, ast.literal_eval(value))
+import os
 k = int(kind[len("speculate"):] or 3) if kind.startswith("speculate") else 0
-s = UpstreamSession(path, 2048, rows=rows, chunk=chunk, logits=bool(k), speculative=k)
+drafter = os.environ.get("TINYLLM_PROFILE_DRAFTER") or None  # a DFlash2 GGUF; the MTP block otherwise
+s = UpstreamSession(path, 2048, rows=rows, chunk=chunk, logits=bool(k), speculative=k, drafter=drafter)
 prompt = [1000 + i % 1000 for i in range(chunk)]
 for _ in range(4): s.prefill(prompt)
 if k:
@@ -80,6 +82,7 @@ def main() -> None:
         "drafting part and the verify part at the first DeltaNet scan of the verify",
     )
     ap.add_argument("--chunk", type=int, default=32)
+    ap.add_argument("--drafter", default=None, help="with --kind speculate: a DFlash2 GGUF instead of the MTP block")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument(
         "--set",
@@ -94,6 +97,8 @@ def main() -> None:
 
     model = str(find_model(args.model))
     env = {**os.environ, "DEBUG": "2"}
+    if args.drafter:
+        env["TINYLLM_PROFILE_DRAFTER"] = os.path.expanduser(args.drafter)
     cmd = [sys.executable, "-c", CHILD, model, str(args.rows), args.kind, str(args.chunk), *args.set]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
     kernels = parse(proc.stdout + proc.stderr)

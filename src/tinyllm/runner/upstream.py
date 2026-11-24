@@ -24,11 +24,13 @@ class UpstreamRunner:
         chunk: int = DEFAULT_CHUNK,
         wait: str = "yield",
         speculative: int = 0,
+        drafter: str | Path | None = None,
     ) -> None:
         self.session = UpstreamSession(
-            model_path, max_context, rows=1, chunk=chunk, logits=True, speculative=speculative
+            model_path, max_context, rows=1, chunk=chunk, logits=True, speculative=speculative, drafter=drafter
         )
-        self.speculative = self.session.speculative  # drafts per cycle; 0 without an MTP block
+        # drafts per cycle, from the MTP block (`drafter` None) or a DFlash2 GGUF; 0 without either
+        self.speculative = self.session.speculative
         set_wait(wait)  # the HTTP thread must get the interpreter while the GPU works (tinyllm.tg.set_wait)
         self.session.reuse_logits = True  # `feed`'s result is used before the next call
         # sampling inside the decode program needs the AMD top-k kernel and memory the host can map
