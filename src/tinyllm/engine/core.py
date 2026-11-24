@@ -71,6 +71,7 @@ class _Active:
     fed: int = 0  # prompt tokens in the model state
     generated: int = 0
     first_token_at: float | None = None
+    last_token_at: float | None = None  # when the last token went to the client
     prefill_seconds: float = 0.0
     last: int | None = None  # the last sampled token, still to be fed
     device: bool = False  # decode samples on the device (runner.feed_sampled)
@@ -241,6 +242,10 @@ class Engine:
         if sample.token in r.end_tokens:
             self._finish(a, "stop")
             return
+        now = time.monotonic()
+        if a.last_token_at is not None:
+            self.metrics.record_token_gap(now - a.last_token_at)
+        a.last_token_at = now
         a.sink(TokenEvent(sample.token, sample))
         if a.generated >= r.max_tokens or a.fed + 1 >= self.runner.max_context:
             self._finish(a, "length")
@@ -250,7 +255,7 @@ class Engine:
             self._admitted -= 1
         self._cancelled.discard(request.id)
         queued = time.monotonic() - request.arrival
-        self.metrics.record_finish(reason, len(request.prompt), 0, 0, queued, None)
+        self.metrics.record_finish(reason, len(request.prompt), 0, 0, queued, None, e2e=queued)
         sink(FinishEvent(reason, len(request.prompt), 0, queue_seconds=queued))
 
     def _finish(self, a: _Active, reason: str, error: str | None = None) -> None:
@@ -274,7 +279,15 @@ class Engine:
             self._admitted -= 1
         self.metrics.running = 0
         self.metrics.record_finish(
-            reason, len(r.prompt), a.generated, a.cached, event.queue_seconds, event.first_token_seconds
+            reason,
+            len(r.prompt),
+            a.generated,
+            a.cached,
+            event.queue_seconds,
+            event.first_token_seconds,
+            e2e=now - r.arrival,
+            prefill=a.prefill_seconds if prompt_fed > 0 else None,
+            decode=decode_seconds if a.first_token_at is not None else None,
         )
         log.info(
             "%s %s prompt %d (cached %d) out %d  queue %.2fs  ttft %s  prefill %s tok/s  decode %s tok/s",

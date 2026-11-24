@@ -227,3 +227,43 @@ def test_prompt_slices_carry_the_next_prompt_token() -> None:
     runner = CountingRunner()
     _run_one(Engine(runner, prefill_slice=4), EngineRequest("a", list(range(10)), GREEDY, max_tokens=2))
     assert runner.followings[:3] == [4, 8, None]
+
+
+def test_latency_and_decode_metrics(engine: Engine) -> None:
+    _collect(_submit(engine, EngineRequest("a", list(range(10)), GREEDY, max_tokens=5)))
+    m = engine.metrics
+    assert m.e2e_time.n == m.prefill_time.n == m.decode_time.n == m.time_per_output_token.n == 1
+    assert m.inter_token_latency.n == 4  # five streamed tokens, four gaps between them
+    assert m.time_per_output_token.total == pytest.approx(m.decode_time.total / 4)
+    assert 0 < m.prefill_time.total <= m.e2e_time.total
+    text = m.render()
+    for name in (
+        "e2e_request_latency_seconds",
+        "request_prefill_time_seconds",
+        "request_decode_time_seconds",
+        "time_per_output_token_seconds",
+        "inter_token_latency_seconds",
+    ):
+        assert f"tinyllm_{name}_count 1" in text or f"tinyllm_{name}_count 4" in text, name
+    assert 'tinyllm_inter_token_latency_seconds_bucket{le="+Inf"} 4' in text
+
+
+def test_a_request_that_never_started_records_only_its_wait(engine: Engine) -> None:
+    long = _submit(engine, EngineRequest("a", [1], GREEDY, max_tokens=100_000))
+    late = _submit(engine, EngineRequest("b", [1], GREEDY, max_tokens=5, queue_timeout=0.05))
+    long.get(timeout=5)
+    time.sleep(0.2)
+    engine.cancel("a")
+    assert _collect(late)[1].reason == "timeout"
+    _collect(long)
+    m = engine.metrics
+    assert m.e2e_time.n == 2 and m.prefill_time.n == 1 and m.decode_time.n == 1  # only "a" ran
+
+
+def test_histograms_take_their_own_buckets() -> None:
+    from tinyllm.engine.metrics import TOKEN_BUCKETS, Histogram
+
+    h = Histogram(TOKEN_BUCKETS)
+    for value in (0.0005, 0.04, 5.0):
+        h.observe(value)
+    assert len(h.counts) == len(TOKEN_BUCKETS) + 1 and h.counts[0] == 1 and h.counts[-1] == 1 and h.n == 3

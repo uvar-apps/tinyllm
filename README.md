@@ -44,6 +44,16 @@ It loads the model, compiles its programs (about 95 s for the 27B), and listens 
 `http://127.0.0.1:8000/v1` (`--host 0.0.0.0` to accept other machines, `--api-key` to require a bearer token).
 Routes: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics` (Prometheus).
 
+`/metrics` (no API key) reports:
+- **requests:** running, waiting, finished by reason;
+- **tokens:** prompt, generated, reused from saved state;
+- **speculative decoding:** steps, drafted and accepted tokens;
+- **latency histograms:** queue time, time to first token, whole request, prompt prefill, decode, time per
+  output token, and the time between streamed tokens.
+
+Decode speed is `generation_tokens_total` over `request_decode_time_seconds_sum`. A speculative step streams its
+tokens together, so the time between tokens is mostly under a millisecond, with one longer gap per step.
+
 ```python
 from openai import OpenAI
 
