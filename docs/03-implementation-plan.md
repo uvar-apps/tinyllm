@@ -340,11 +340,12 @@ Exit criteria: the same oracle and API test suites pass on each platform, with a
 4. Start-up: compiling the 27B's programs takes 94 seconds (about 140 with the speculative cycle); pickled programs
    with the weights bound from the GGUF at load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
    the chunk compiles the variable-length program on first use; the phase 1 server should compile both at start.
-5. Long context (coding work, research findings 5.10). Decoding and the verify now share a split-K attention kernel
-   on the matrix cores, bit-exact with each other and more accurate than upstream's. At 32k positions a DFlash2 cycle
-   went from 309 to 185 ms and a one-token step from 98 to 94 ms. Each verify row still reads the cache itself,
-   about 58 ms of the cycle at 32k. A block that computes every row from one tile would cut most of that, but it
-   needs the rows' softmax state to fit in one block. Other coding items:
+5. Long context (coding work, research findings 5.10). Decoding and the verify share a split-K attention kernel on
+   the matrix cores, bit-exact with each other and more accurate than upstream's. A block reads each cache tile
+   once for up to four rows. DFlash2 cycles went from 309 to 154 ms at 32k and from 404 to 283 ms at 128k, and a
+   one-token step at 128k from 126 to 123 ms (Gufo: 117.5). The 8-row verify still reads the cache twice (two
+   4-row launches). Reading it once needs an 8-row block within the register budget, or one wave per row
+   computing the scores. An 8-bit cache would halve the rest. Other coding items:
    - a Python and Rust decode benchmark at agent context lengths;
    - `--ctx` above 32,768;
    - a second state slot for side requests.

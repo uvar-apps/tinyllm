@@ -555,6 +555,54 @@ Decoding's logits moved by 0.02 to 0.1, more than the AMD goldens' same-device t
 
 Both 0.8B records agree with the CPU golden over all 48 of its steps (top-4 logits). Both 27B records have our token in llama.cpp's top-k on 96 of 96 steps, with the same single disagreement.
 
+**Up to 128k positions, and against Gufo** (same model and machine; Gufo's published table of 2026-10-19, `UD-Q4_K_XL`, f16 cache). Every decode step reads the 16 attention layers' whole cache, 64 KiB per position. That is 2.1 GB at 32k and 8.6 GB at 128k, on top of about 16.5 GB of weights. At about 256 GB/s, no engine can keep a dense-attention model's speed flat with context.
+
+| Context | tinyllm one-token step | Gufo plain decode | tinyllm DFlash2 cycle |
+|---|---|---|---|
+| ~0 | 81.0 ms (12.3 tok/s) | 80.8 ms (12.37 tok/s) | 120.6 ms |
+| 32k | 91.5 ms (10.9) | 89.8 ms (11.13) | 179.7 ms |
+| 64k | 104.5 ms (9.6) | 99.3 ms (10.07) | 264.7 ms |
+| 128k | 126.0 ms (7.9) | 117.5 ms (8.51) | 404.5 ms |
+
+Gufo's DFlash2 also falls with depth: 26.9 → 19.8 → 15.3 tok/s on mixed text and 64.7 → 51.2 → 29.9 on repetitive text, at 0, 32k and 128k. The engines that publish flat curves, Strata (Qwen3.8-Flash-Next) and Maya (GLM-5.3-Flash), serve models whose attention keeps only a fixed number of selected or compressed positions per token.
+
+One-token decoding is 2 to 7% behind Gufo at depth, close to the bandwidth floor. The verify was not: each of its rows read the cache itself, so a DFlash2 cycle grew 284 ms by 128k, where reading the cache once would cost about 35 ms.
+
+**Shared tiles** (2026-11-24). `decode_mma`'s block now takes one KV head and up to four rows, four waves per row, and reads each key and value tile once for all of them. Each row's work is unchanged from a one-row block, with three differences that leave every value the same:
+- the query is read from memory, or for one row copied to local memory once;
+- each row keeps one probability tile instead of one per wave;
+- the values past each row's length are zeroed in registers just before its product.
+
+Decoding runs the same kernel with one row.
+
+| 32k positions, 27B shapes | Before | Now |
+|---|---|---|
+| 1 row | 0.71 ms | 0.695 ms (193 GB/s) |
+| 4 rows | | 1.14 ms |
+| 8 rows | 3.65 ms | 2.25 ms (two 4-row launches) |
+
+Exactness across builds held for four waves per row but not for two: at two, the 8-row and 1-row builds differed by one ulp past 3,072 keys. The C source of their arithmetic was identical, so the compiler fuses multiply-adds differently in the two builds. Every shape the server builds (1, 2 and 4 rows, both head layouts) is checked in the GPU tests; positions change only loop counts and masks, so a build that agrees at the checked positions agrees at all.
+
+What did not help:
+- **8-row blocks of 32 waves:** 3.0 ms. The kernels compile in CU mode, so 32 waves leave each about 96 registers.
+- **One buffer for keys and then values:** a barrier per round stops the next keys loading during the current product, and one row went from 0.74 to 1.45 ms.
+- **The query in local memory for several rows:** it limits a block to two rows, 3.0 ms for eight.
+
+| Context | One-token step | DFlash2 cycle, before → now | DFlash2 tok/s |
+|---|---|---|---|
+| 1,024 | 81.0 ms | 120.6 → 120.0 ms | 57.9 |
+| 32,768 | 90.8 ms | 179.7 → 154.0 ms | 50.6 |
+| 65,536 | 103.1 ms | 264.7 → 199.5 ms | 39.3 |
+| 131,072 | 123.1 ms | 404.5 → 282.6 ms | 16.2 |
+
+Context now adds 163 ms to a DFlash2 cycle at 128k, down from 284. Two levers remain:
+- **Reading the cache once for all 8 rows:** a block of 8 rows that fits the registers, or a row's scores computed by one wave instead of four.
+- **An 8-bit cache option:** it would halve what context costs decoding and the verify alike, but it changes the numerics.
+
+Checks:
+- `tools/rollback_check.py`: identical at 4 and 8 rows on both models.
+- `tools/spec_check.py` on the 27B: identical on all 15 runs (DFlash2 30.3 tok/s, MTP 28.1).
+
 ## 6. External baselines (published, not reproduced here)
 
 llama.cpp, Qwen3.8-27B on Strix Halo:

@@ -42,7 +42,8 @@ def main() -> int:
     ap.add_argument("--heads", default="24,4", help="query heads and KV heads (default: the 27B's)")
     ap.add_argument("--context", type=int, default=8192)
     ap.add_argument("--time", type=int, default=0, metavar="N", help="also time at N positions")
-    ap.add_argument("--grid", default=None, help="range ids of the grid axes, e.g. head=0,row=1,split=4")
+    ap.add_argument("--grid", default=None, help="range ids of the grid axes, e.g. head=0,split=1")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a decode_mma setting")
     args = ap.parse_args()
 
     from tinyllm.tg import Tensor, TinyJit, UOp, synchronize  # chooses the device before tinygrad is imported
@@ -51,6 +52,9 @@ def main() -> int:
     decode = importlib.import_module("tinygrad.llm.kernels.amd").amd_flash_attention_decode
     if args.grid:
         decode_mma.GRID = {k: int(x) for k, x in (kv.split("=") for kv in args.grid.split(","))}
+    for setting in args.set:
+        name, value = setting.split("=", 1)
+        setattr(decode_mma, name, int(value))
     H, H_KV = (int(x) for x in args.heads.split(","))
     M, D = args.rows, 256
     rng = np.random.default_rng(0)

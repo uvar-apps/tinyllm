@@ -206,7 +206,8 @@ def test_unknown_kernel_names_are_rejected() -> None:
         ["tools/attention_rows_check.py"],
         ["tools/attention_rows_check.py", "--heads", "8,2", "--rows", "4", "--context", "1024"],
         ["tools/decode_mma_check.py"],
-        ["tools/decode_mma_check.py", "--heads", "8,2", "--rows", "4", "--context", "1024"],
+        ["tools/decode_mma_check.py", "--rows", "6"],
+        ["tools/decode_mma_check.py", "--heads", "8,2", "--rows", "4", "--context", "4096"],
     ],
     ids=[
         "bf16",
@@ -233,6 +234,7 @@ def test_unknown_kernel_names_are_rejected() -> None:
         "rows-attention",
         "rows-attention-small",
         "decode-mma",
+        "decode-mma-6-rows",
         "decode-mma-small",
     ],
 )

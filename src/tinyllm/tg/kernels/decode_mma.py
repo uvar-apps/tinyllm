@@ -5,18 +5,25 @@ lane and reduces across the wave for every score. It reads the cache at about 14
 rows of a speculative verify its cost grows with rows times keys even when each key is read once
 (`tinyllm.tg.kernels.attention`, research findings 5.10).
 
-Here a block takes one row and one KV head: that row's query heads of the KV head (6 on Qwen3.8-27B), padded to
-a 16-row matrix tile. Scores and the weighted sum of values are WMMA products, following the tile loop of
-upstream's prefill kernel (`_amd_flash_attention`). The key tiles are dealt out to `SPLITS` blocks per row (tile t
-to block t mod SPLITS). Each block keeps an online softmax over its tiles and writes its unnormalized sum, maximum
-and total. A second kernel combines the blocks of each (row, head).
+Here a block takes one KV head and up to `MAX_ROWS` rows, four waves per row. A row's slots are its query heads of
+the KV head (6 on Qwen3.8-27B), padded to a 16-row matrix tile. Scores and the weighted sum of values are WMMA
+products, following the tile loop of upstream's prefill kernel (`_amd_flash_attention`). The key tiles are dealt
+out to `SPLITS` blocks (tile t to block t mod SPLITS), and a block reads each tile once for all its rows. Each row
+keeps an online softmax over the block's tiles and writes its unnormalized sum, maximum and total. A second kernel
+combines the blocks of each (row, head).
 
-A block's work depends only on its row: its queries, its length, and the keys and values before that length.
-Keys past it only produce scores that are then masked out, and values past it are zeroed before the product. So
-the same row gives the same result bit for bit whether it is decoded alone or verified among several, provided
-decoding takes this kernel too (`tools/decode_mma_check.py`). The zeroing has to be per row: the matrix units do
-not add a zero probability times a value as an exact zero, so values past a row's length that differ (the next
-verify rows' entries, or stale ones when decoding) would change its last bits.
+A row's work depends only on that row: its queries, its length, and the keys and values before that length. Keys
+past it only produce scores that are masked out, and the values past it are zeroed in registers before the row's
+product. The zeroing has to be per row: the matrix units do not add a zero probability times a value as an exact
+zero, so values past a row's length that differ (the next verify rows' entries, or stale ones when decoding) would
+change its last bits. Tiles past a row's length that its block scans for later rows leave its sums unchanged.
+
+So a row gives the same result decoded alone (one row, the query in local memory) and verified among several,
+bit for bit, provided decoding takes this kernel too. The compiler's choice of fused multiply-adds can still differ
+between builds of different shapes; two waves per row instead of four did (by one ulp, past 3,072 keys). Every
+shape the server builds (1, 2 and 4 rows; the 27B's and the 0.8B's heads) is checked by `tools/decode_mma_check.py`
+in the GPU tests; a build that agrees at the checked positions agrees at all, since positions only change loop
+counts and masks.
 
 Mirrors `_amd_flash_attention` at the pinned commit for the tile loop; re-check on every tinygrad bump.
 """
@@ -53,10 +60,11 @@ from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 SPLITS = 48  # blocks a row's key tiles are dealt to, per KV head
 SLOTS = WMMA_M  # query rows of a block: one row's heads of one KV head, padded to a matrix tile
-WAVES_M, WAVES_N = 1, 4  # one tile of query rows; the four waves share out the output dimensions
-THREADS = WARP_SIZE * WAVES_M * WAVES_N
-# range ids of the grid axes (2 and 3 are the waves); the order decides which blocks run side by side
-GRID = {"head": 0, "split": 1, "row": 4}  # rows slowest: 3.65 ms for 8 rows at 32k, against 4.4 to 5.2
+WAVES_N = 4  # waves per row: they share out the output dimensions (each output's arithmetic is the same for any)
+MAX_ROWS = 4  # rows in one block; more, or a count that is not a power of two, take several launches
+Q_LOCAL = 1  # blocks of at most this many rows copy the query slots to local memory once (it fits)
+# range ids of the grid axes (2 and 3 are the waves' local axes)
+GRID = {"head": 0, "split": 1}
 
 
 @functools.cache
@@ -67,36 +75,43 @@ def _partial(part: UOp, stats: UOp, q: UOp, cache: UOp, valid_first: Any, rows: 
     splits = part.shape[1]
     k, v = cache[0].reshape(B * H_KV, N, cache_dim), cache[1].reshape(B * H_KV, N, cache_dim)
     assert isinstance(D, int) and D % WMMA_K == 0 and D % (WAVES_N * LANES_PER_WAVE_N) == 0 and rows * SLOTS == RS
-    TM, TN = SLOTS // (WAVES_M * LANES_PER_WAVE_M), BLOCK_N // LANES_PER_WAVE_N
+    row_threads = WARP_SIZE * WAVES_N
+    threads = rows * row_threads
+    assert BLOCK_N * D % threads == 0, "rows must divide the key tile's loads (a power of two up to MAX_ROWS)"
+    TM, TN = SLOTS // LANES_PER_WAVE_M, BLOCK_N // LANES_PER_WAVE_N
     TD, SCALE = D // (WAVES_N * LANES_PER_WAVE_N), 1 / math.sqrt(D)
-    tiles_last = (valid_first + (rows - 1) + BLOCK_N - 1) // BLOCK_N
-    live = min(tiles_last, splits) if isinstance(tiles_last, int) else tiles_last.minimum(splits)
-    block_bh, row = UOp.range(BKV, GRID["head"], AxisType.GLOBAL), UOp.range(rows, GRID["row"], AxisType.GLOBAL)
-    split = UOp.range(live, GRID["split"], AxisType.GLOBAL)
-    valid = valid_first + row  # this row attends to its own position and every one before
-    tiles = (valid + BLOCK_N - 1) // BLOCK_N
-    q = q.reshape(BKV, rows, SLOTS, D)[block_bh, row]
-    k, v = k[block_bh], v[block_bh]
-    wave_m, wave_n = UOp.range(WAVES_M, 2, AxisType.LOCAL), UOp.range(WAVES_N, 3, AxisType.LOCAL)
+    last = valid_first + (rows - 1)  # the last row's length: the block scans its tiles, the others mask the rest
+    tiles = (last + BLOCK_N - 1) // BLOCK_N
+    live = min(tiles, splits) if isinstance(tiles, int) else tiles.minimum(splits)
+    block_bh, split = UOp.range(BKV, GRID["head"], AxisType.GLOBAL), UOp.range(live, GRID["split"], AxisType.GLOBAL)
+    # four waves per row: each row's work is what a block of `rows=1` does, the rows share the key and value tiles
+    row, wave_n = UOp.range(rows, 2, AxisType.LOCAL), UOp.range(WAVES_N, 3, AxisType.LOCAL)
     lane = UOp.range(WARP_SIZE, -1, AxisType.WARP)
-    tid = (wave_m * WAVES_N + wave_n) * WARP_SIZE + lane
+    tid, rtid = (row * WAVES_N + wave_n) * WARP_SIZE + lane, wave_n * WARP_SIZE + lane
     lane_m, lane_n = lane // LANES_PER_WAVE_N, lane % LANES_PER_WAVE_N
-    Q_ELEMS, KV_ELEMS = SLOTS * D // THREADS, BLOCK_N * D // THREADS
-    QP_lds = UOp.alloc((SLOTS, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)
+    valid = valid_first + row  # this row attends to its own position and every one before
+    KV_ELEMS = BLOCK_N * D // threads
+    if rows <= Q_LOCAL:  # every row's query slots copied to local memory once, before the tiles
+        Q_ELEMS = rows * SLOTS * D // threads
+        Q_lds = UOp.alloc((rows * SLOTS, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :D]
+        q_rows = q.reshape(BKV, rows * SLOTS, D)[block_bh].reshape(threads, Q_ELEMS)
+        Q_lds = Q_lds.after(Q_lds.reshape(threads, Q_ELEMS)[tid].store(q_rows[tid]))
+        qv = Q_lds.reshape(rows, SLOTS, D)[row]
+    else:  # this row's query slots, read from memory at each tile
+        qv = q.reshape(BKV, rows, SLOTS, D)[block_bh, row]
+    k, v = k[block_bh], v[block_bh]
     KV_lds = UOp.alloc((BLOCK_N, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :D]
     acc, m_i, l_i = _reg((TM, TD), 0), _reg((TM,), -math.inf), _reg((TM,), 0)
     rnd = UOp.range((tiles - split + splits - 1) // splits, 100)  # this block's tiles: split, split + SPLITS, ...
     tile = split + rnd * splits
-    Q_lds = QP_lds[:, :D]
-    Q_store = Q_lds.after(rnd).reshape(THREADS, Q_ELEMS)[tid].store(q.reshape(THREADS, Q_ELEMS)[tid])
     load_k = UOp.range(KV_ELEMS, 90)
     kval = k.reshape(N * D)[tile * BLOCK_N * D + tid * KV_ELEMS + load_k]
-    K_store = KV_lds.reshape(THREADS, KV_ELEMS)[tid, load_k].store(kval).end(load_k)
-    Q_lds, KV_lds_k = Q_lds.after(Q_store, K_store), KV_lds.after(Q_store, K_store)
+    K_store = KV_lds.reshape(threads, KV_ELEMS)[tid, load_k].store(kval).end(load_k)
+    KV_lds_k = KV_lds.after(K_store)
     S_reg = _reg((TM, TN), 0, rnd)
     k_qk, tm1, tn1 = UOp.range(D // WMMA_K, 101), UOp.range(TM // WMMA_ACC, 200), UOp.range(TN, 201)
     S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
-    q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
+    q_frag = qv.after(rnd).reshape(TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[tm1, lane_n, k_qk]
     k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
     q_frag, k_frag = (_wmma_fragment(f, lane, rdna4) for f in (q_frag, k_frag))
     qk = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk).barrier()
@@ -113,18 +128,19 @@ def _partial(part: UOp, stats: UOp, q: UOp, cache: UOp, valid_first: Any, rows: 
     S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
     p_local, ri_ws = _reg((TM,), 0, rnd), UOp.range(TM, 295)
     p_sum = p_local.after(p_local[ri_ws].store(sum(warp_reduce(S_reg[ri_ws, rn]) for rn in range(TN))).end(ri_ws))
-    P_lds = QP_lds.flatten()[: WAVES_N * SLOTS * BLOCK_N].reshape(WAVES_N, SLOTS, BLOCK_N)
+    # one probability tile per row; its four waves computed the same scores and store the same values
+    P_lds = UOp.alloc((rows, SLOTS, BLOCK_N), dtypes.half, addrspace=AddrSpace.LOCAL)
     # gfx11 distributes even/odd rows between half-waves; gfx12 distributes the low/high eight rows.
     row_shape = (LANES_PER_WAVE_M, TM) if rdna4 else (TM, LANES_PER_WAVE_M)
     row_lane, row_elem = (2, 3) if rdna4 else (3, 2)
     P_write = (
-        P_lds.reshape(WAVES_N, WAVES_M, *row_shape, TN, LANES_PER_WAVE_N)
+        P_lds[row]
+        .reshape(1, 1, *row_shape, TN, LANES_PER_WAVE_N)
         .permute(1, 0, row_lane, 5, row_elem, 4)
-        .reshape(THREADS, TM, TN)
+        .reshape(WARP_SIZE, TM, TN)
     )
-    P_store = P_write[tid].store(S_reg.cast(dtypes.half))
+    P_store = P_write[lane].store(S_reg.cast(dtypes.half))
     beta_i, ri4, rj4 = UOp.alloc((TM,), dtypes.float, addrspace=AddrSpace.REG), UOp.range(TM, 330), UOp.range(TD, 331)
-    # the first tile always holds a valid key (tile `split` < `tiles`), so the running maximum is finite after it
     m_new = m_i[ri4].maximum(m_ij[ri4])
     alpha_val, beta_val = ((m_i[ri4] - m_new) * LOG2E).exp2(), ((m_ij[ri4] - m_new) * LOG2E).exp2()
     correction = UOp.group(
@@ -138,18 +154,22 @@ def _partial(part: UOp, stats: UOp, q: UOp, cache: UOp, valid_first: Any, rows: 
     V_lds = UOp.alloc((D, BLOCK_N + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
     V_copy, load_v = V_lds.after(qk).permute(1, 0), UOp.range(KV_ELEMS, 390)
     v_pos = tile * BLOCK_N + (tid * KV_ELEMS + load_v) // D
-    # values past the row's length are zeroed: what lies there differs between decoding and the verify
-    vval = (v_pos < valid).where(v.reshape(N * D)[tile * BLOCK_N * D + tid * KV_ELEMS + load_v], 0)
-    V_store = V_copy.reshape(THREADS, KV_ELEMS)[tid, load_v].store(vval).end(load_v)
+    # values past the last row's length may be unwritten: zeroed here, and past each row's own length below
+    vval = (v_pos < last).where(v.reshape(N * D)[tile * BLOCK_N * D + tid * KV_ELEMS + load_v], 0)
+    V_store = V_copy.reshape(threads, KV_ELEMS)[tid, load_v].store(vval).end(load_v)
     P_lds, V_lds = P_lds.after(P_store, V_store), V_lds.after(P_store, V_store)
     pv_acc = _reg((TM, TD), 0, rnd)
     k_pv, tm2, tn2 = UOp.range(BLOCK_N // WMMA_K, 400), UOp.range(TM // WMMA_ACC, 401), UOp.range(TD, 402)
     pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-    p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)
-    p_frag = p_frag[wave_m, tm2, lane_n, k_pv]
+    p_frag = P_lds[row].reshape(TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[tm2, lane_n, k_pv]
     v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
-    p_frag, v_frag = (_wmma_fragment(f, lane, rdna4) for f in (p_frag, v_frag))
-    pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
+    # this row's values: those past its own length zeroed in registers, as a one-row block zeroes them on loading
+    # (the matrix units do not add a zero probability times a value as an exact zero)
+    v_row, vi = UOp.alloc((WMMA_K,), dtypes.half, addrspace=AddrSpace.REG), UOp.range(WMMA_K, 403)
+    v_key = tile * BLOCK_N + k_pv * WMMA_K + vi
+    v_row = v_row.after(v_row[vi].store((v_key < valid).where(v_frag[vi], v_frag[vi].const_like(0))).end(vi))
+    p_frag, v_row = (_wmma_fragment(f, lane, rdna4) for f in (p_frag, v_row))
+    pv_done = pv_frag.store(UOp.wmma(p_frag, v_row, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
     pv_acc = pv_acc.after(pv_done)
     ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
     rnd_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).end(rnd)
@@ -157,20 +177,20 @@ def _partial(part: UOp, stats: UOp, q: UOp, cache: UOp, valid_first: Any, rows: 
     # this block's unnormalized sum, maximum and total for each slot: the combine kernel weighs the blocks
     out = part.reshape(BKV, splits, rows, SLOTS, D)[block_bh, split, row]
     out = (
-        out.reshape(WAVES_M, *row_shape, WAVES_N, TD, LANES_PER_WAVE_N)
+        out.reshape(1, *row_shape, WAVES_N, TD, LANES_PER_WAVE_N)
         .permute(0, 3, row_lane - 1, 5, row_elem - 1, 4)
-        .reshape(THREADS, TM, TD)
+        .reshape(row_threads, TM, TD)
     )
     rs = UOp.range(TM, 420)
-    slot = row * SLOTS + wave_m * WMMA_M + (lane_m * TM + rs if rdna4 else rs * LANES_PER_WAVE_M + lane_m)
+    slot = row * SLOTS + (lane_m * TM + rs if rdna4 else rs * LANES_PER_WAVE_M + lane_m)
     # every lane of a half-wave holds the same maximum and total for its slots: duplicate stores of one value
     stat_stores = UOp.group(
         stats[block_bh, split, slot, 0].store(m_i[rs]), stats[block_bh, split, slot, 1].store(l_i[rs])
     ).end(rs)
     return (
-        UOp.group(out[tid].store(acc), stat_stores)
-        .end(wave_m, wave_n, lane)
-        .end(split, row, block_bh)
+        UOp.group(out[rtid].store(acc), stat_stores)
+        .end(row, wave_n, lane)
+        .end(split, block_bh)
         .sink(arg=KernelInfo(name="flash_decode_mma", opts_to_apply=()))
     )
 
@@ -253,6 +273,18 @@ def decode_attention(original: Any) -> Any:
 def flash_decode_mma(q: Tensor, cache_kv: Tensor, valid_first: Any) -> Tensor:
     """Attention of `q` (B, H, M, D), row j over the first `valid_first + j` positions of `cache_kv`
     (2, B, H_KV, N, D) half: (B, H, M, D) float32. Each row's result is the same for any M."""
+    M = int(q.shape[2])
+    if M <= MAX_ROWS and M & (M - 1) == 0:
+        return _launch(q, cache_kv, valid_first)
+    outs, start = [], 0
+    while start < M:  # launches of a power of two of rows each: a row's work does not depend on the others
+        n = 1 << (min(M - start, MAX_ROWS).bit_length() - 1)
+        outs.append(_launch(q[:, :, start : start + n], cache_kv, valid_first + start))
+        start += n
+    return outs[0].cat(*outs[1:], dim=2)
+
+
+def _launch(q: Tensor, cache_kv: Tensor, valid_first: Any) -> Tensor:
     if isinstance(valid_first, UOp):  # carry the length binding into the graph, as decoding does
         cache_kv = Tensor(cache_kv.uop.after(valid_first))
     B, H, M, D = q.shape

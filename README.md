@@ -137,7 +137,7 @@ tinyllm adds its own GPU kernels where tinygrad has no fast path (`src/tinyllm/t
 | `iq4xs` | IQ4_XS, prefill up to 32 rows | UD-Q4_K_XL: 18% less time in these layers, output bit-identical to tinygrad's |
 | `q6k` | Q6_K, prefill only | Q6_K file prefill: 123 → 162 tok/s (decode was already at the limit) |
 | `q8` | Q8_0, prefill only | Q8_0 file prefill: 131 → 210 tok/s (with fixed-length chunks, below) |
-| `attention` | one-token attention and the speculative verify, gfx11 | at 32k positions: decode step 98 → 94 ms, DFlash2 cycle 309 → 185 ms |
+| `attention` | one-token attention and the speculative verify, gfx11 | DFlash2 cycle at 32k: 309 → 154 ms; at 128k: 404 → 283 ms |
 
 They are on by default. `TINYLLM_KERNELS=none` (or a subset, such as `dense`) selects tinygrad's own paths for
 comparison. `tools/dense_kernel_check.py`, `tools/q4_kernel_check.py` and `tools/prefill_kernel_check.py` check them on
