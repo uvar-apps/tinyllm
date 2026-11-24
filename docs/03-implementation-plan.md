@@ -340,6 +340,14 @@ Exit criteria: the same oracle and API test suites pass on each platform, with a
 4. Start-up: compiling the 27B's programs takes 94 seconds (about 140 with the speculative cycle); pickled programs
    with the weights bound from the GGUF at load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
    the chunk compiles the variable-length program on first use; the phase 1 server should compile both at start.
+5. Long context (coding work, research findings 5.10). The verify's attention now runs all rows in one launch,
+   bit-exact with decoding: DFlash2 at 32k positions went from 25.8 to 35.9 tok/s. About 90 ms of the 223 ms cycle
+   at 32k is still attention, bound by the decode kernel's cross-lane reductions. A split-K kernel on the matrix
+   cores, shared by decoding and the verify, would remove most of it, but it changes decoding's attention away
+   from upstream's kernel. Other coding items:
+   - a Python and Rust decode benchmark at agent context lengths;
+   - `--ctx` above 32,768;
+   - a second state slot for side requests.
 
 ## Decisions wanted from you
 

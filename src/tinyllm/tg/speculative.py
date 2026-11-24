@@ -37,9 +37,10 @@ import operator
 from typing import Any
 
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.llm.kernels.amd import flash_attention
+from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention
 from tinygrad.llm.model import GatedDeltaNetBlock, TransformerBlock, apply_rope
 
+from tinyllm.tg.kernels import attention
 from tinyllm.tg.kernels.deltanet import gated_delta_step
 
 
@@ -134,9 +135,10 @@ class SpecAttentionBlock(TransformerBlock):  # type: ignore[misc]
 
     Otherwise tinygrad's tiled attention, which needs multiples of 32 rows, would send a few rows down its generic
     float32 path while decoding uses half-precision queries (about 1e-3 per layer), and the norms and the store
-    would round differently for several rows. Per-row attention also keeps long contexts on the fast kernel: each
-    row reads the keys once more, against the generic path's float copy of the whole cache. Mirrors
-    `TransformerBlock._attention` at the pinned commit (re-check on bumps).
+    would round differently for several rows. On AMD one launch of `tinyllm.tg.kernels.attention.flash_decode_rows`
+    covers every row, computing each exactly as decoding's kernel would. Called once per row, decoding's kernel
+    took 60% of a DFlash2 cycle at 32k positions. Mirrors `TransformerBlock._attention` at the pinned commit
+    (re-check on bumps).
     """
 
     recording = False
@@ -167,6 +169,16 @@ class SpecAttentionBlock(TransformerBlock):  # type: ignore[misc]
             target = cache.shrink(tuple((pos + j, pos + j + 1) if i == 3 else None for i in range(cache.ndim)))
             stores.append(target.uop.store(value.cast(cache.dtype).uop))
         kv = Tensor(cache.uop.after(*stores)).transpose(0, 1)
+        if amd_custom_kernels_supported(x.device) and attention.supported(qs[0], kv):
+            # all rows in one launch, each computed as decoding's kernel computes it (tinyllm.tg.kernels.attention).
+            # Each row's query is realized on its own first, as decoding realizes its kernel's input: computed in
+            # one kernel for all rows, the norm and RoPE round differently (rows from the third on, at 8 rows).
+            hq = [z.half().contiguous() for z in qs]
+            q = hq[0].cat(*hq[1:], dim=2)
+            attn = attention.flash_decode_rows(q, kv, pos + 1, int(kv.shape[3])).transpose(1, 2).reshape(B, T, -1)
+            if gates[0] is not None:
+                attn = attn * gates[0].cat(*gates[1:], dim=1).sigmoid()
+            return self.attn_output(attn)
         rows = []
         for j in range(T):
             attn = flash_attention(qs[j], kv, pos + (j + 1)).transpose(1, 2).reshape(B, 1, -1)  # decoding's call

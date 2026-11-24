@@ -35,17 +35,21 @@ import ast, importlib, sys
 from tinyllm import device
 device.configure("amd")
 from tinyllm.tg.upstream import UpstreamSession
-path, rows, kind, chunk = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
-for setting in sys.argv[5:]:  # module.NAME=value, applied to tinyllm.tg.kernels.<module>
+path, rows, kind, chunk, context = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+for setting in sys.argv[6:]:  # module.NAME=value, applied to tinyllm.tg.kernels.<module>
     target, value = setting.split("=", 1)
     module, name = target.rsplit(".", 1)
     setattr(importlib.import_module(f"tinyllm.tg.kernels.{module}"), name, ast.literal_eval(value))
 import os
 k = int(kind[len("speculate"):] or 3) if kind.startswith("speculate") else 0
 drafter = os.environ.get("TINYLLM_PROFILE_DRAFTER") or None  # a DFlash2 GGUF; the MTP block otherwise
-s = UpstreamSession(path, 2048, rows=rows, chunk=chunk, logits=bool(k), speculative=k, drafter=drafter)
+s = UpstreamSession(path, context + 2048, rows=rows, chunk=chunk, logits=bool(k), speculative=k, drafter=drafter)
 prompt = [1000 + i % 1000 for i in range(chunk)]
 for _ in range(4): s.prefill(prompt)
+if context > s.pos:  # fill the context first, without printing a timing line for each of its kernels
+    shown, sys.stdout = sys.stdout, open(os.devnull, "w")
+    s.prefill([1000 + i % 1000 for i in range(context - s.pos)], wait_each=False)
+    sys.stdout = shown
 if k:
     rows_ = [[0.0, 1.0, 1.0, 0.0, 0.0]] * (k + 1)
     for _ in range(4): s.speculate(1000, rows_)
@@ -82,6 +86,7 @@ def main() -> None:
         "drafting part and the verify part at the first DeltaNet scan of the verify",
     )
     ap.add_argument("--chunk", type=int, default=32)
+    ap.add_argument("--context", type=int, default=0, help="prefill this many tokens first: profile at that position")
     ap.add_argument("--drafter", default=None, help="with --kind speculate: a DFlash2 GGUF instead of the MTP block")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument(
@@ -99,7 +104,7 @@ def main() -> None:
     env = {**os.environ, "DEBUG": "2"}
     if args.drafter:
         env["TINYLLM_PROFILE_DRAFTER"] = os.path.expanduser(args.drafter)
-    cmd = [sys.executable, "-c", CHILD, model, str(args.rows), args.kind, str(args.chunk), *args.set]
+    cmd = [sys.executable, "-c", CHILD, model, str(args.rows), args.kind, str(args.chunk), str(args.context), *args.set]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
     kernels = parse(proc.stdout + proc.stderr)
     if not kernels:

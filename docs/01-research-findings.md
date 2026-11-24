@@ -493,6 +493,31 @@ With checkpoints, a step waits 5 to 6.5 s, the cost of the tool output it adds p
 
 Prefill runs at 240 to 255 tok/s on these increments, against 316 on long prompts from position 0. The calls are shorter, and attention reads 10,000 to 18,000 positions of context. Decode during thinking ran at 20 to 34 tok/s with DFlash2 at these lengths.
 
+### 5.10 Speculative decoding at long context
+
+Coding contexts run to tens of thousands of tokens. The attention cache of the 27B holds 64 KiB per position: 2 GiB at 32k, 134 MB per attention layer. `tools/context_bench.py` prefills one session with Python and Rust code up to each length. It then times one-token steps and greedy DFlash2 cycles there (`UD-Q4_K_XL`, 7 drafts):
+
+| Context | One-token step | DFlash2 cycle, per-row attention | DFlash2 cycle, rows kernel | Tokens per cycle | tok/s before | tok/s after |
+|---|---|---|---|---|---|---|
+| 1,024 | 81.8 ms | 128.7 ms | 122.3 ms | 6.83 | 53.1 | 56.1 |
+| 8,192 | 85.3 ms | 170.1 ms | 141.7 ms | 4.29 | 25.1 | 30.3 |
+| 16,384 | 91.1 ms | 219.9 ms | 172.2 ms | 6.42 | 29.1 | 37.2 |
+| 32,768 | 98.0 ms | 309.3 ms | 222.9 ms | 8.00 | 25.8 | 35.9 |
+
+(Tokens per cycle depend on what the model writes at each length; this corpus repeats, so the drafts often all hold. They are the same before and after, as they must be.)
+
+Going from 1k to 32k positions costs a one-token step 16 ms but cost a DFlash2 cycle 181 ms. Profiled at 32k (`tools/profile_step.py --context 32768`), `flash_decode_partial` took 182 of the cycle's 303 ms. That was 128 calls, 8 verify rows × 16 layers, because the bit-exact verify ran decoding's attention kernel once per row and so read the whole cache once per row.
+
+`tinyllm.tg.kernels.attention.flash_decode_rows` covers all rows in one launch. It is upstream's partial and combine kernels with the row as one more grid axis, each row with its own valid length. A row's work is the same operations in the same order, so it equals decoding's call bit for bit (`tools/attention_rows_check.py`, at positions around chunk boundaries and past the 3,072 keys where a block runs several rounds). The verify and decoding still agree exactly (`tools/rollback_check.py` at 4 and 8 rows on the 0.8B and the 27B).
+
+Two details mattered:
+- **Realize each row's query on its own first.** Concatenated before realizing, the eight rows' norm and RoPE compiled into one kernel and rounded differently from the third row on.
+- **Put the row on the slowest grid axis.** Rows slowest gave 5.7 ms for 8 rows at 32k, rows fastest 7.2, against 11.3 for eight calls.
+
+Sharing the reads through the cache is not what limits it: one row alone reaches only about 140 GB/s. Decoding's kernel holds 8 of a key's 256 dimensions per lane and needs a cross-lane reduction for every score, so its cost grows with rows × keys even when the keys are read once.
+
+What remains at 32k is about 90 ms of the 223 ms cycle in this attention. A split-K kernel on the matrix cores could read the cache once for all rows and all six query heads of a KV head, as a small matrix product. It would bring the cycle close to its short-context cost. But decoding would have to use the same kernel for the verify to stay bit-exact, which changes decoding's attention numerics away from upstream's.
+
 ## 6. External baselines (published, not reproduced here)
 
 llama.cpp, Qwen3.8-27B on Strix Halo:
