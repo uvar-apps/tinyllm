@@ -474,6 +474,25 @@ Through the server (`tinyllm serve --draft-model`) the OpenAI SDK checks all pas
 
 Gufo's published DFlash2 rows for the same files on this machine (one 128-token request per prompt, greedy, thinking off) land in the same place: 50.3 tok/s on a C++ ring buffer, 46.9 on the train puzzle, 22.8 to 28.0 on creative, Chinese, Italian and instruction prompts; its 71.55 tok/s headline is a prompt that repeats a word, where all seven drafts always hold.
 
+### 5.9 Prompt reuse in a coding agent's loop
+
+An agent sends the whole conversation on every step: system prompt and tool definitions, the task, then each reply and each tool's output. Until now the runner reused its state only when a new prompt extended every token it held. A CPU simulation through Qwen3.8's chat template showed why that fails. A client that does not send `reasoning_content` back gets each reply re-rendered without its reasoning, so the prompts part where that reply starts. The template also trims a reply's reasoning and content, so even a client that sends the reasoning back gets a reply that ended in whitespace rendered differently. In both cases the whole conversation was prefilled again.
+
+The runner now keeps up to eight copies of the recurrent state (design 4.4; 150 MiB and about 1.5 ms each) and resumes from the nearest one below the point where the prompts part. They are taken before each prompt's last prefill call and every 256 generated tokens. Resuming gives bit for bit the logits of the calls it replaces: `tests/test_checkpoints.py` checks this on the CPU, and `tools/checkpoint_check.py` on the 27B with MTP and DFlash2 cycles.
+
+Measured with `tools/agent_bench.py` against `tinyllm serve` on `UD-Q4_K_XL` with DFlash2. The session has eight steps of greedy decoding with thinking on and 400 tokens per reply. The prompt starts at 4,400 tokens, and each step adds Python or Rust files of about 1,300 to 1,500 tokens, reaching 15,600 to 18,000.
+
+| Client, server | Tokens prefilled, steps 1 to 7 | Waiting for the first token, steps 1 to 7 | Step 7 |
+|---|---|---|---|
+| Reasoning not sent back, no checkpoints | 80,300 | 266.5 s | 54.3 s |
+| Reasoning not sent back, 8 checkpoints | 11,400 | 43.9 s | 5.5 s |
+| Reasoning sent back, no checkpoints | 28,000 | 101.2 s | 63.9 s |
+| Reasoning sent back, 8 checkpoints | 11,400 | 44.2 s | 6.4 s |
+
+With checkpoints, a step waits 5 to 6.5 s, the cost of the tool output it adds plus at most one chunk. That no longer depends on the conversation's length. Without them, a client that drops the reasoning waits in proportion to the whole conversation, 54 s at 15,600 tokens. A client that sends the reasoning back keeps its reuse until a reply comes back rendered differently. Here that happened at step 7, the first reply to finish with an answer (`content` trimmed), and it cost a full 18,077-token prefill in 64 s.
+
+Prefill runs at 240 to 255 tok/s on these increments, against 316 on long prompts from position 0. The calls are shorter, and attention reads 10,000 to 18,000 positions of context. Decode during thinking ran at 20 to 34 tok/s with DFlash2 at these lengths.
+
 ## 6. External baselines (published, not reproduced here)
 
 llama.cpp, Qwen3.8-27B on Strix Halo:

@@ -201,6 +201,7 @@ def test_unknown_kernel_names_are_rejected() -> None:
         ],
         ["tools/sampler_check.py"],
         ["tools/rollback_check.py"],
+        ["tools/checkpoint_check.py"],
     ],
     ids=[
         "bf16",
@@ -223,12 +224,14 @@ def test_unknown_kernel_names_are_rejected() -> None:
         "q5_k-shared-prefetch",
         "gpu-sampler",
         "deltanet-rollback",
+        "state-checkpoints",
     ],
 )
 def test_kernel_on_the_gpu(check: list[str]) -> None:
     """Small shapes through every code path of each kernel: decode and matrix-core, ragged chunks, odd row counts."""
     for extra in ([],):
-        quick = [] if check[0].endswith(("sampler_check.py", "rollback_check.py")) else ["--quick"]
+        whole = ("sampler_check.py", "rollback_check.py", "checkpoint_check.py")
+        quick = [] if check[0].endswith(whole) else ["--quick"]
         cmd = [sys.executable, check[0], *quick, *check[1:], *extra]
         if check[0].endswith("dense_kernel_check.py"):
             cmd += ["--rows", "1,3,8,32"]

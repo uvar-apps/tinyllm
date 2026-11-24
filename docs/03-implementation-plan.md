@@ -220,6 +220,16 @@ Exit criteria
 - A short new request arriving while another stream prefills 20,000 tokens gets its first token in under 1.5 s.
 - Start to ready in under 25 s with a warm program cache.
 
+**Status, 2026-11-24: 2e's checkpoints built ahead of phase 2**, for the one-sequence runner
+(`tinyllm.runner.checkpoints`, `tinyllm serve --state-checkpoints N`; design 4.4, research findings 5.9). Up to
+eight copies of the recurrent state are taken before each prompt's last prefill call and every 256 generated
+tokens. A prompt that departs from the held tokens resumes from the newest one below the point of departure, with
+the same logits bit for bit as the calls it replaces. In an eight-step coding-agent session on the 27B (4,400 to
+18,000 tokens), waiting for the first token fell from 266 s to 44 s for a client that does not send reasoning
+back, and from 101 s to 44 s for one that does. Each step now costs its new tokens, whatever the conversation's
+length. Not yet: the host-side state store and matching across slots, which need phase 2's slots. Until then a
+side request with another prompt (a chat title, say) evicts the conversation.
+
 ## Phase 3 — Speculative decoding
 
 Purpose: get past the bandwidth ceiling for a single stream (design 4.10).

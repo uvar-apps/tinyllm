@@ -64,8 +64,12 @@ print(reply.choices[0].message.content)
   `logit_bias`, `seed`, `logprobs` and `top_logprobs`. Unset values default to the model file's recommendation
   (Qwen3.8: temperature 1.0, top-k 20, top-p 0.95).
 - One request runs at a time. Others wait, at most `--max-waiting` of them (16 by default); beyond that the server
-  answers 429. A client that disconnects cancels its request, and a request that extends the previous conversation
-  exactly reuses its state.
+  answers 429. A client that disconnects cancels its request.
+- Prompt reuse: a request that extends the previous conversation reuses its state. One that departs from it, as a
+  coding agent's next step does when the chat template re-renders the last reply without its reasoning, resumes from
+  the nearest of up to eight copies of the recurrent state (`--state-checkpoints N`, 157 MB each on the 27B, 0 to
+  turn them off). Copies are taken before each prompt's last prefill chunk and every 256 generated tokens. Usage
+  reports the reused tokens as `prompt_tokens_details.cached_tokens`.
 - On Qwen3.8-27B `UD-Q4_K_XL`, decode runs at 12.5 tok/s and a long prompt prefills at about 317 tok/s. Greedy
   decoding, and top-k up to 32 with temperature, top-p and min-p (Qwen3.8's defaults), sample inside the decode
   program on the GPU; penalties, logit bias and other top-k values sample on the host, at about 12 tok/s.

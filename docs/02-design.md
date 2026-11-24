@@ -125,6 +125,13 @@ KV entries are addressed by position and never change once written, so any prefi
 
 **Checkpoints.** The engine copies the recurrent and convolution state (150 MiB, about 1.5 ms) at chosen positions: the end of the prompt, the end of each generated turn, and every few thousand tokens of a long prefill. A request whose tokens match a cached sequence up to position `p` resumes from the latest checkpoint at or before `p` and prefills only what follows. Without checkpoints, any edit to earlier conversation history would force a full re-prefill, which is what upstream does today.
 
+*Built for one sequence (phase 1 runner, `tinyllm.runner.checkpoints`).* The case that matters most is a coding agent's loop. Each request repeats the conversation with the previous reply re-rendered by the chat template, and a client that does not send `reasoning_content` back gets that reply rendered without its reasoning. The new prompt then departs from the held tokens where the reply starts, and all-or-nothing reuse re-prefilled the whole conversation on every step. `UpstreamRunner` keeps up to eight checkpoints (`tinyllm serve --state-checkpoints N`). They are taken in two places:
+
+- before each prompt's last prefill call, which puts one at most one chunk before the point where the reply starts, without splitting a call;
+- every 256 tokens while decoding, for replies that are re-rendered with their reasoning but differ later, in a tool call's formatting say.
+
+`begin` resumes from the newest checkpoint at or below the shared prefix and drops the checkpoints past it. When the slots are full, the lowest position goes first, except the newest prompt checkpoint. A copy is one captured program, one assignment per state tensor (96 on the 27B), queued between prefill calls without a wait. A pending speculative rollback is applied before a copy and discarded by a restore. The KV caches of the main model, the MTP block and the DFlash2 drafter are indexed by position, so they need nothing. Resuming gives bit for bit the logits of the calls it replaces (`tests/test_checkpoints.py` on the CPU, `tools/checkpoint_check.py` on the GPU, with MTP and DFlash2 cycles).
+
 **State store.** Host-side memory holding parked sequences (KV prefix plus checkpoints) under a byte budget with LRU eviction. It doubles as the prefix cache across slots: admitting a request copies the matching prefix into the assigned slot. On unified memory this is a plain memory copy at around 200 GB/s. Block-level deduplication between stored sequences is a later refinement.
 
 **Resets** are engine operations (zero a slot's recurrent state) and not flags inside kernels. This is what lets rows in one step sit at unrelated positions.

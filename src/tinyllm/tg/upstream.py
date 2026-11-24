@@ -17,12 +17,13 @@ from __future__ import annotations
 import functools
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.model import GatedDeltaNetBlock, Transformer, TransformerBlock
 from tinygrad.llm.tokenizer import SimpleTokenizer
 
 from tinyllm.tg import (
@@ -126,6 +127,7 @@ class UpstreamSession:
         static_chunks: bool | None = None,
         speculative: int = 0,
         drafter: str | Path | None = None,
+        checkpoints: int = 0,
     ) -> None:
         self.rows, self.chunk, self.logits = rows, chunk, logits
         set_polling_wait(polling_wait)
@@ -186,6 +188,11 @@ class UpstreamSession:
         self.trace: list[StepRecord] = []
         if self.speculative:
             self._init_speculative()
+        # copies of the recurrent state at chosen positions (`save_state`, `load_state`); 0 where the model keeps
+        # state that is neither indexed by position nor in DeltaNet blocks
+        self.checkpoints = checkpoints if checkpoints > 0 and self._checkpointable() else 0
+        self._slots: list[list[Any]] = []  # per checkpoint, one buffer per tensor of `_state_tensors`
+        self._save_jit, self._load_jit = TinyJit(self._copy_state), TinyJit(self._paste_state)
 
     def tokenizer(self) -> Any:
         return SimpleTokenizer.from_gguf_kv(self.kv)
@@ -195,6 +202,77 @@ class UpstreamSession:
         self.pos, self._sampled = 0, None
         if self.speculative:
             self._restore_row, self._spec_prev = None, None
+
+    # ---- recurrent-state checkpoints (tinyllm.runner.checkpoints) ----
+
+    def _checkpointable(self) -> bool:
+        """Whether every piece of state that is not indexed by position is a DeltaNet block's (Qwen3.8's layout):
+        attention caches need no copy to go back to an earlier position, the recurrent state does."""
+        ssm = self.model.config.ssm
+        for b in self.model.blk:
+            if hasattr(b, "ple"):
+                return False
+            if isinstance(b, GatedDeltaNetBlock):
+                if ssm is None or ssm.kda:
+                    return False
+            elif type(b) not in (TransformerBlock, spec.SpecAttentionBlock):
+                return False
+        return True
+
+    def _state_tensors(self) -> list[Any]:
+        """The DeltaNet blocks' recurrent and convolution states (none for a model without such blocks)."""
+        blocks = [b for b in self.model.blk if isinstance(b, GatedDeltaNetBlock)]
+        if blocks and not hasattr(blocks[0], "recurrent_state"):
+            raise RuntimeError("the model has not run yet: there is no state to checkpoint")
+        return [t for b in blocks for t in (b.recurrent_state, b.conv_state)]
+
+    @property
+    def checkpoint_bytes(self) -> int:
+        """The size of one checkpoint, 0 before the model has run."""
+        try:
+            return sum(int(t.nbytes()) for t in self._state_tensors())
+        except RuntimeError:
+            return 0
+
+    def _copy_state(self, *slot: Any) -> Any:
+        writes = [d.assign(s) for d, s in zip(slot, self._state_tensors(), strict=True)]
+        Tensor.realize(*writes)
+        return writes[0]
+
+    def _paste_state(self, *slot: Any) -> Any:
+        writes = [s.assign(d) for s, d in zip(self._state_tensors(), slot, strict=True)]
+        Tensor.realize(*writes)
+        return writes[0]
+
+    def save_state(self, slot: int) -> None:
+        """Queue a copy of the recurrent state, the state after the first `pos` tokens, into checkpoint `slot`.
+        The buffers of every slot are allocated on first use (`checkpoint_bytes` each)."""
+        if not 0 <= slot < self.checkpoints:
+            raise ValueError(f"checkpoint slot {slot} outside the session's {self.checkpoints}")
+        self._settle()  # a rollback still pending belongs to the state being copied
+        states = self._state_tensors()
+        if not states:  # attention only: going back costs nothing
+            return
+        if not self._slots:
+            self._slots = [
+                [Tensor.zeros(*t.shape, dtype=t.dtype, device=t.device).contiguous().realize() for t in states]
+                for _ in range(self.checkpoints)
+            ]
+        self._save_jit(*self._slots[slot])
+
+    def load_state(self, slot: int, pos: int) -> None:
+        """Put back checkpoint `slot`, taken at position `pos`: the next call continues from there. The attention
+        caches past `pos` are masked out and overwritten as the new tokens arrive, so they need nothing."""
+        if not 0 < pos < self.max_context:
+            raise ValueError(f"cannot resume at position {pos}")
+        self._restore_row = None  # a rollback still pending belongs to the state being replaced
+        if self._state_tensors():
+            if not self._slots:
+                raise ValueError("no checkpoint has been saved")
+            self._load_jit(*self._slots[slot])
+        self.pos, self._sampled = pos, None
+        if self.speculative:
+            self._spec_prev = None  # the next prefill or decode call sets it
 
     # ---- speculative decoding (tinyllm.tg.speculative) ----
 
@@ -423,8 +501,17 @@ class UpstreamSession:
         )
         return result
 
-    def prefill(self, tokens: list[int], wait_each: bool = True, following: int | None = None) -> Any:
+    def prefill(
+        self,
+        tokens: list[int],
+        wait_each: bool = True,
+        following: int | None = None,
+        before_last: Callable[[], None] | None = None,
+    ) -> Any:
         """Feed `tokens` to every row, `chunk` tokens per call. Returns the output of the last call (see `step`).
+
+        `before_last` is called before the last call is queued, with `pos` at its first token (where a caller
+        takes a checkpoint of the state, `save_state`).
 
         With speculative decoding the MTP block's KV is written for these rows too: each row pairs with the token
         after it, which for the last row is `following` when the caller knows it (the next slice of a prompt),
@@ -455,6 +542,8 @@ class UpstreamSession:
         start = time.perf_counter()
         while self.pos < end:
             n = min(self.chunk, end - self.pos)
+            if before_last is not None and self.pos + n == end:
+                before_last()
             lo = self._v_pos.bind(self.pos)
             # slicing by bound variables lets every chunk and every position reuse one compiled program;
             # with static chunks a full chunk has a fixed length and goes to its own program

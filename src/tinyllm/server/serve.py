@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tinyllm.runner.checkpoints import CHECKPOINTS
+
 log = logging.getLogger("tinyllm.serve")
 
 # GGUF keys of the model's recommended sampling settings -> SamplingParams names
@@ -56,7 +58,14 @@ def main(args: argparse.Namespace) -> int:
     drafter = Path(args.draft_model).expanduser() if args.draft_model else None
     default = (DFLASH_DRAFTS if drafter else DEFAULT_DRAFTS) if drafter or has_mtp(path) else 0
     k = args.speculative if args.speculative is not None else default
-    runner = UpstreamRunner(path, args.ctx, chunk=args.chunk, speculative=k, drafter=drafter if k else None)
+    runner = UpstreamRunner(
+        path,
+        args.ctx,
+        chunk=args.chunk,
+        speculative=k,
+        drafter=drafter if k else None,
+        checkpoints=args.state_checkpoints,
+    )
     tokenizer = GGUFTokenizer(runner.kv)
     template = None
     if tokenizer.chat_template and not args.no_chat_template:
@@ -66,6 +75,9 @@ def main(args: argparse.Namespace) -> int:
     log.info("loaded %s in %.1fs%s; compiling", path.name, time.perf_counter() - start, drafting)
     runner.warmup()
     log.info("compiled in %.1fs", runner.warmup_seconds)
+    if runner.checkpoints.slots:
+        size = runner.session.checkpoint_bytes / 2**20
+        log.info("%d state checkpoints of %.0f MiB for prompt reuse", runner.checkpoints.slots, size)
 
     engine = Engine(runner, max_waiting=args.max_waiting, prefill_slice=args.chunk * args.prefill_chunks)
     name = args.name or str(runner.kv.get("general.name") or path.stem)
@@ -117,5 +129,14 @@ def add_parser(sub: Any) -> None:
         default=None,
         metavar="GGUF",
         help="a DFlash2 drafter (e.g. Qwen3.8-27B-DFlash2-Q4_K_M.gguf) instead of the model's own MTP block",
+    )
+    sp.add_argument(
+        "--state-checkpoints",
+        type=int,
+        default=CHECKPOINTS,
+        metavar="N",
+        help="copies of the recurrent state kept so a prompt that departs from the previous one (an agent's reply "
+        "re-rendered by the chat template) resumes near that point; 0 to reuse only exact extensions "
+        "(default: %(default)s)",
     )
     sp.set_defaults(fn=main)
