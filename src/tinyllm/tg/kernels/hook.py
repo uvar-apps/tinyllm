@@ -1,8 +1,10 @@
-"""Routes linear layers of tinygrad.llm models to tinyllm's kernels.
+"""Routes linear layers of tinygrad.llm models to tinyllm's kernels, and one-token attention to tinyllm's.
 
 `install()` wraps `tinygrad.llm.kernels.amd.Linear.__call__` in this process. At a layer's first call
 the wrapper checks whether the layer's weights are something a tinyllm kernel serves; if not, or if
 that kernel is not enabled, the layer keeps tinygrad's own path. The decision is stored on the layer.
+With "attention" enabled it also wraps the model's `flash_attention`, so one-token calls (decoding) run on
+`tinyllm.tg.kernels.decode_mma`, which the speculative verify then uses too.
 """
 
 from __future__ import annotations
@@ -12,12 +14,13 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from tinygrad import Tensor
+from tinygrad.llm import model as llm_model
 from tinygrad.llm.kernels import amd
 
-from tinyllm.tg.kernels import dense, densemm, iq4xs, q4, q6k, q8, q45k
+from tinyllm.tg.kernels import decode_mma, dense, densemm, iq4xs, q4, q6k, q8, q45k
 
 ENV = "TINYLLM_KERNELS"  # "all" (default), "none", or a comma-separated subset of KERNELS
-KERNELS = ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8")
+KERNELS = ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention")
 Run = Callable[[Any, Tensor, Callable[[Any, Tensor], Tensor]], Tensor]  # (layer, x, tinygrad's own call)
 # prefill-only kernels: they take over tinygrad's packed weights and hand the rows they do not serve back to it
 _PREFILL: dict[str, tuple[Callable[[Any], Any], Run]] = {
@@ -92,6 +95,8 @@ def install(names: Iterable[str] = KERNELS) -> None:
     if unknown := [n for n in names if n not in KERNELS]:
         raise ValueError(f"unknown kernel(s) {unknown}; choose from {list(KERNELS)}")
     _enabled.update(names)
+    if "attention" in names and not hasattr(llm_model.flash_attention, "_tinyllm_original"):
+        llm_model.flash_attention = decode_mma.decode_attention(llm_model.flash_attention)
     original = amd.Linear.__call__
     if getattr(original, "_tinyllm_hook", False):
         return

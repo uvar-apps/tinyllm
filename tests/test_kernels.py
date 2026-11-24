@@ -150,8 +150,9 @@ def test_dense_mm_serves_multiples_of_16_rows_of_large_layers() -> None:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8")),
-        ("all", ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8")),
+        (None, ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention")),
+        ("all", ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention")),
+        ("q8,attention", ("q8", "attention")),
         ("none", ()),
         ("0", ()),
         ("q4", ("q4",)),
@@ -204,6 +205,8 @@ def test_unknown_kernel_names_are_rejected() -> None:
         ["tools/checkpoint_check.py"],
         ["tools/attention_rows_check.py"],
         ["tools/attention_rows_check.py", "--heads", "8,2", "--rows", "4", "--context", "1024"],
+        ["tools/decode_mma_check.py"],
+        ["tools/decode_mma_check.py", "--heads", "8,2", "--rows", "4", "--context", "1024"],
     ],
     ids=[
         "bf16",
@@ -229,12 +232,20 @@ def test_unknown_kernel_names_are_rejected() -> None:
         "state-checkpoints",
         "rows-attention",
         "rows-attention-small",
+        "decode-mma",
+        "decode-mma-small",
     ],
 )
 def test_kernel_on_the_gpu(check: list[str]) -> None:
     """Small shapes through every code path of each kernel: decode and matrix-core, ragged chunks, odd row counts."""
     for extra in ([],):
-        whole = ("sampler_check.py", "rollback_check.py", "checkpoint_check.py", "attention_rows_check.py")
+        whole = (
+            "sampler_check.py",
+            "rollback_check.py",
+            "checkpoint_check.py",
+            "attention_rows_check.py",
+            "decode_mma_check.py",
+        )
         quick = [] if check[0].endswith(whole) else ["--quick"]
         cmd = [sys.executable, check[0], *quick, *check[1:], *extra]
         if check[0].endswith("dense_kernel_check.py"):

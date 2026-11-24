@@ -40,7 +40,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention
 from tinygrad.llm.model import GatedDeltaNetBlock, TransformerBlock, apply_rope
 
-from tinyllm.tg.kernels import attention
+from tinyllm.tg.kernels import attention, decode_mma
 from tinyllm.tg.kernels.deltanet import gated_delta_step
 
 
@@ -169,13 +169,19 @@ class SpecAttentionBlock(TransformerBlock):  # type: ignore[misc]
             target = cache.shrink(tuple((pos + j, pos + j + 1) if i == 3 else None for i in range(cache.ndim)))
             stores.append(target.uop.store(value.cast(cache.dtype).uop))
         kv = Tensor(cache.uop.after(*stores)).transpose(0, 1)
-        if amd_custom_kernels_supported(x.device) and attention.supported(qs[0], kv):
-            # all rows in one launch, each computed as decoding's kernel computes it (tinyllm.tg.kernels.attention).
-            # Each row's query is realized on its own first, as decoding realizes its kernel's input: computed in
-            # one kernel for all rows, the norm and RoPE round differently (rows from the third on, at 8 rows).
+        # All rows in one launch, each computed as decoding computes it: on the matrix-core kernel when decoding
+        # runs on it (tinyllm.tg.kernels.decode_mma), else on upstream's decode kernel with a row axis
+        # (tinyllm.tg.kernels.attention). Each row's query is realized on its own first, as decoding realizes its
+        # own: computed in one kernel for all rows, the norm and RoPE round differently (from the third row on).
+        mma = decode_mma.installed() and decode_mma.supported(qs[0], kv)
+        if mma or (amd_custom_kernels_supported(x.device) and attention.supported(qs[0], kv)):
             hq = [z.half().contiguous() for z in qs]
             q = hq[0].cat(*hq[1:], dim=2)
-            attn = attention.flash_decode_rows(q, kv, pos + 1, int(kv.shape[3])).transpose(1, 2).reshape(B, T, -1)
+            if mma:
+                attn = decode_mma.flash_decode_mma(q, kv, pos + 1)
+            else:
+                attn = attention.flash_decode_rows(q, kv, pos + 1, int(kv.shape[3]))
+            attn = attn.transpose(1, 2).reshape(B, T, -1)
             if gates[0] is not None:
                 attn = attn * gates[0].cat(*gates[1:], dim=1).sigmoid()
             return self.attn_output(attn)

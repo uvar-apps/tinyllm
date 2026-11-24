@@ -516,7 +516,44 @@ Two details mattered:
 
 Sharing the reads through the cache is not what limits it: one row alone reaches only about 140 GB/s. Decoding's kernel holds 8 of a key's 256 dimensions per lane and needs a cross-lane reduction for every score, so its cost grows with rows × keys even when the keys are read once.
 
-What remains at 32k is about 90 ms of the 223 ms cycle in this attention. A split-K kernel on the matrix cores could read the cache once for all rows and all six query heads of a KV head, as a small matrix product. It would bring the cycle close to its short-context cost. But decoding would have to use the same kernel for the verify to stay bit-exact, which changes decoding's attention numerics away from upstream's.
+What remained at 32k was about 90 ms of the 223 ms cycle in this attention.
+
+**Decode attention on the matrix cores** (`tinyllm.tg.kernels.decode_mma`, the `attention` entry of `TINYLLM_KERNELS`, on by default on gfx11). Decoding and the verify both run on it, which is what keeps them equal. Each block takes one row and one KV head, with that row's six query heads padded to a 16-row WMMA tile. Scores and the weighted sum of values are matrix products, following the tile loop of upstream's prefill kernel. A row's 32-key tiles are dealt to 48 blocks, and a second kernel combines them.
+
+A block's work depends only on its row, so a row decoded alone and the same row in an 8-row verify agree bit for bit (`tools/decode_mma_check.py`). One detail mattered: the matrix units do not add a zero probability times a value as an exact zero. Values past the row's length must therefore be zeroed per row. A first version shared a tile between rows and zeroed values past the block's last row; it differed by 1 to 8 ulps on every other row.
+
+Against a float64 reference it is 2 to 13 times more accurate than upstream's decode kernel (4.5e-5 against 4.9e-4 at 3,000 positions). Upstream's kernel rounds each wave's partial sum to half precision.
+
+| 32k positions, 27B shapes | Time | Cache read rate |
+|---|---|---|
+| 1 row, upstream's decode kernel | 0.96 ms | 139 GB/s |
+| 1 row, matrix cores | 0.71 ms | 189 GB/s |
+| 8 rows, rows kernel (above) | 5.75 ms | |
+| 8 rows, matrix cores | 3.65 ms | |
+
+The grid's order matters: rows on the slowest axis gave 3.65 ms, against 4.4 to 5.2 with rows faster. Each row's blocks still read the keys and values themselves, about 1 GB at 32k for 8 rows. Sharing one tile between rows would need every row's softmax state in one block, more than the registers hold at 8 rows with this tile layout.
+
+The 27B with DFlash2 (`tools/context_bench.py`). Text differs slightly from before, since decoding rounds differently now; compare the times.
+
+| Context | One-token step | DFlash2 cycle | Tokens per cycle | tok/s |
+|---|---|---|---|---|
+| 1,024 | 81.0 ms (81.8 before) | 120.6 ms (128.7 at the start of this section) | 6.92 | 57.5 |
+| 8,192 | 83.5 ms (85.3) | 133.2 ms (170.1) | 4.79 | 36.0 |
+| 16,384 | 88.5 ms (91.1) | 152.6 ms (219.9) | 6.21 | 40.6 |
+| 32,768 | 94.0 ms (98.0) | 184.8 ms (309.3) | 7.67 | 41.3 |
+
+The verify still equals decoding bit for bit (`tools/rollback_check.py` at 4 and 8 rows on the 0.8B and the 27B). `tools/spec_check.py` on the 27B is identical on all 15 runs: DFlash2 30.3 tok/s overall (greedy and seeded), MTP 28.1.
+
+Decoding's logits moved by 0.02 to 0.1, more than the AMD goldens' same-device tolerance of 0.02, so eight of the nine were re-recorded; the BF16 one still passed. The new numbers are no less accurate at the model level:
+
+| Comparison | Mean difference | Max difference |
+|---|---|---|
+| 0.8B AMD vs the CPU golden (float32 attention), upstream attention | 0.045 | 0.44 |
+| 0.8B AMD vs the CPU golden, matrix-core attention | 0.047 | 0.38 |
+| 27B `UD-Q4_K_XL` vs llama.cpp on the CPU (`tinyllm oracle reference`), log-probability, upstream attention | 0.0117 | 0.146 |
+| 27B `UD-Q4_K_XL` vs llama.cpp, log-probability, matrix-core attention | 0.0114 | 0.108 |
+
+Both 0.8B records agree with the CPU golden over all 48 of its steps (top-4 logits). Both 27B records have our token in llama.cpp's top-k on 96 of 96 steps, with the same single disagreement.
 
 ## 6. External baselines (published, not reproduced here)
 

@@ -7,6 +7,7 @@
   iq4xs     IQ4_XS weights, prefill only; decode stays on tinygrad's kernel (iq4xs.py)
   q6k       Q6_K weights, prefill only; decode stays on tinygrad's kernel (q6k.py)
   q8        Q8_0 weights, prefill only; decode stays on tinygrad's kernel (q8.py)
+  attention one-token attention on the matrix cores, and the speculative verify with it (decode_mma.py)
 
 They follow the structure of tinygrad's kernels in `tinygrad/llm/kernels` and reuse its helpers,
 so they are tied to the pinned tinygrad commit like everything else under `tinyllm.tg`.
