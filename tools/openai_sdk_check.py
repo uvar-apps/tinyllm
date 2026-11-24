@@ -126,8 +126,10 @@ def check_seed(client: openai.OpenAI, model: str) -> str:
 
 
 def check_tools(client: openai.OpenAI, model: str) -> str:
+    # greedy: this checks the server's tool-call round trip, and sampled, a small model sometimes answers
+    # without calling the tool (the 0.8B did once in five runs)
     messages: list[dict[str, Any]] = [{"role": "user", "content": "What is the weather in Paris right now?"}]
-    r = client.chat.completions.create(model=model, messages=messages, tools=[WEATHER], max_tokens=1024)
+    r = client.chat.completions.create(model=model, messages=messages, tools=[WEATHER], max_tokens=1024, temperature=0)
     choice = r.choices[0]
     assert choice.finish_reason == "tool_calls" and choice.message.tool_calls, (choice.finish_reason, choice.message)
     call = choice.message.tool_calls[0]
@@ -141,7 +143,9 @@ def check_tools(client: openai.OpenAI, model: str) -> str:
             "content": json.dumps({"city": "Paris", "sky": "sunny", "celsius": 21}),
         },
     ]
-    final = client.chat.completions.create(model=model, messages=messages, tools=[WEATHER], max_tokens=1024)
+    final = client.chat.completions.create(
+        model=model, messages=messages, tools=[WEATHER], max_tokens=1024, temperature=0
+    )
     answer = final.choices[0].message.content or ""
     assert final.choices[0].finish_reason == "stop" and "21" in answer, (final.choices[0].finish_reason, answer)
     return f"called {call.function.name}({call.function.arguments}); answer {answer.strip()[:60]!r}"
