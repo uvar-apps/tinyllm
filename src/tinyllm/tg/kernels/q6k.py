@@ -44,12 +44,14 @@ from tinygrad.llm.kernels.amd_gguf import (
     _wmma_words,
 )
 
-from tinyllm.tg.kernels.wmma import FP16_1024, byte_pairs, center_scale, splat_half, wmma_linear
+from tinyllm.tg.kernels import gemm
+from tinyllm.tg.kernels.wmma import FP16_1024, bind_rows, byte_pairs, center_scale, splat_half, valid_rows, wmma_linear
 
 # Overrides for experiments (tools/prefill_kernel_check.py); None selects by row count, see `_config`.
 GROUPS_PER_STEP: int | None = None
 PACKED: bool | None = None
 NO_WEIGHTS = False  # diagnostic: constant weights, no weight loads. Wrong results; shows what the rest costs.
+GEMM = True  # calls of whole 128-row blocks go to the tiled kernel (gemm.py)
 LDS_BYTES: int | None = None  # experiments: local memory reserved per workgroup instead of RESERVE_LDS
 TILES: tuple[int, int] | None = None  # experiments: (token tile, output tiles per wave) instead of the default
 # Local memory reserved per workgroup (wmma.wmma_stores). In a `UD-Q4_K_XL` pass, ms in this kernel at chunk
@@ -93,6 +95,7 @@ def _q6k_wmma_kernel(
     no_weights: bool = False,
     lds_bytes: int = 0,
     tiles: tuple[int, int] | None = None,
+    rows: Any = None,
 ) -> UOp:
     tokens = int(out.shape[0])
     token_tile, output_tiles = 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else 16, 2
@@ -144,6 +147,7 @@ def _q6k_wmma_kernel(
         lanes,
         groups_per_step,
         lds_bytes=lds_bytes,
+        rows=rows,
     )
 
 
@@ -161,9 +165,12 @@ def q6k_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor])
     tokens = int(prod(x.shape[:-1]))
     if tokens % 16 or out_features % 16:
         return fallback(layer, x)
+    if GEMM and gemm.serves(layer, x, Q6_K):  # large prefill calls: the tiled kernel
+        return gemm.gemm_linear(layer, layer.weight, Q6_K, x)
     cdna = _is_cdna(x.device)
     kgroups, lanes = (4, 64) if cdna else (2 if _is_rdna4(x.device) else 1, 32)
     groups, packed = _config(tokens, in_features)
+    rows = valid_rows()
     fxn = functools.partial(
         _q6k_wmma_kernel,
         out_features=out_features,
@@ -175,10 +182,13 @@ def q6k_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor])
         no_weights=NO_WEIGHTS,
         lds_bytes=RESERVE_LDS if LDS_BYTES is None else LDS_BYTES,
         tiles=TILES,
+        rows=rows,
     )
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
     # exactly tinygrad's form (no reshape first): layers sharing an input then share one fp16 copy of it, so
     # mixing these kernels with tinygrad's does not change how the producer of that input is scheduled
     xs = x.cast(dtypes.float16).contiguous()
-    result = Tensor.custom_kernel(out, layer.weight, xs, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+    result = Tensor.custom_kernel(out, layer.weight, bind_rows(xs, rows), fxn=fxn)[0].reshape(
+        *x.shape[:-1], out_features
+    )
     return result if layer.bias is None else result + layer.bias

@@ -37,11 +37,11 @@ import operator
 from typing import Any
 
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention
-from tinygrad.llm.model import GatedDeltaNetBlock, TransformerBlock, apply_rope
+from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention, gated_delta_prefill
+from tinygrad.llm.model import GatedDeltaNetBlock, PLELayer, TransformerBlock, apply_rope
 
 from tinyllm.tg.kernels import attention, decode_mma
-from tinyllm.tg.kernels.deltanet import gated_delta_step
+from tinyllm.tg.kernels.deltanet import gated_delta_rows, gated_delta_step
 
 
 class SpecDeltaNetBlock(GatedDeltaNetBlock):  # type: ignore[misc]
@@ -56,15 +56,79 @@ class SpecDeltaNetBlock(GatedDeltaNetBlock):  # type: ignore[misc]
     recording = False
     snapshots: Any = None  # T - 1 buffers (B, H, V, K) float32: the recurrent state after each row but the last
     conv_window: Any = None  # (B, kernel - 1 + T, channels): the convolution's previous inputs, then the T rows
+    padding: Any = None  # a padded prefill call (`padded`): (real rows as a bound variable, the checkpoint's row)
+    mid_state: Any = None  # the recurrent and convolution state at that row, as `recurrent_state` and `conv_state`
+    mid_conv: Any = None
 
     def allocate(self, rows: int, device: str, batch: int = 1) -> None:
-        """Buffers for verify calls of `rows` tokens."""
+        """Buffers for verify calls of up to `rows` tokens."""
         state = (batch, self.num_v_heads, self.head_v_dim, self.head_k_dim)
         self.snapshots = [Tensor.zeros(*state, device=device).contiguous().realize() for _ in range(rows - 1)]
         shape = (batch, self.ssm_conv_kernel - 1 + rows, self.conv_channels)
         self.conv_window = Tensor.zeros(*shape, device=device).contiguous().realize()
 
+    def allocate_mid(self, device: str, batch: int = 1) -> None:
+        """Buffers for the state at a row inside a padded prefill call."""
+        state = (batch, self.num_v_heads, self.head_v_dim, self.head_k_dim)
+        self.mid_state = Tensor.zeros(*state, device=device).contiguous().realize()
+        conv = (batch, self.ssm_conv_kernel - 1, self.conv_channels)
+        self.mid_conv = Tensor.zeros(*conv, device=device).contiguous().realize()
+
+    def _padded(self, x: Tensor, start_pos: Any) -> Tensor:
+        """`GatedDeltaNetBlock._attention` for a call whose rows past `real` are padding, and whose state after
+        row `mid` - 1 is kept (0: not). Mirrors the pinned commit for the non-KDA, AMD, fixed-length case, with two
+        changes. Padding rows are exact no-ops for the recurrent state, as upstream makes the padding of a
+        symbolic chunk: beta 0 and decay 1. And the states are those after the last real row: the convolution's
+        from the window at `real`, the recurrent one from the scan, which also leaves it at `mid` on its way."""
+        real, mid = self.padding
+        B, T, _ = x.shape
+        ssm = self.config.ssm
+        assert len(start_pos) == 1 and isinstance(T, int) and not ssm.kda and 0 <= mid < T, "padded: one fixed length"
+        pos = start_pos[0]
+        assert isinstance(pos, UOp), "a padded call needs the position as a bound variable"
+        initial = Tensor(pos).eq(0)
+        hist = self.ssm_conv_kernel - 1
+
+        x = x.half()
+        out_gate = self.attn_gate(x).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+        g = (self.ssm_alpha(x).float() + self.ssm_dt["bias"]).reshape(B, T, self.num_v_heads, -1)
+        a, lb = self.ssm_a.reshape(self.num_v_heads, -1), ssm.gate_lower_bound
+        log_alpha = g.softplus() * a if lb is None else (g * a.abs()).sigmoid() * lb
+        keep = Tensor.arange(T).reshape(1, T, 1) < Tensor(real)
+        beta, log_alpha = keep.where(beta, 0), keep.unsqueeze(-1).where(log_alpha, 0)
+
+        state, weight = self.conv_state, self.ssm_conv1d["weight"].flatten(1)
+        window = initial.where(0, state).cat(self.attn_qkv(x).cast(state.dtype), dim=1).contiguous()  # (B, hist + T, C)
+        stores = [state.uop.store(window[:, real : real + hist].uop)]
+        if mid:
+            stores.append(self.mid_conv.uop.store(window[:, mid : mid + hist].uop))
+        taps = (window[:, i : i + T] * weight[:, i] for i in range(weight.shape[1]))
+        conv = functools.reduce(operator.add, taps).silu()
+        q, k, v = conv.split([self.q_dim, self.q_dim, self.conv_channels - 2 * self.q_dim], dim=-1)
+        q, k = (z.reshape(B, T, self.num_k_heads, self.head_k_dim) for z in (q, k))
+        repeat = self.num_v_heads // self.num_k_heads
+        q, k = ((z.rmsnorm(eps=1e-6 / self.head_k_dim) / self.head_k_dim**0.5).repeat(1, 1, repeat, 1) for z in (q, k))
+        v = v.reshape(B, T, self.num_v_heads, self.head_v_dim)
+        q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
+        q = q * self.head_k_dim**-0.5
+        alpha = log_alpha.transpose(1, 2).exp()
+        if mid:
+            snapshots = [(mid, self.mid_state.uop)]
+            core = gated_delta_rows(
+                q, k, v, beta, alpha, self.recurrent_state.uop, snapshots, Tensor(pos), tuple(stores)
+            )
+        else:
+            core = gated_delta_prefill(
+                q, k, v, beta, alpha, Tensor(self.recurrent_state.uop.after(*stores)), Tensor(pos)
+            )
+        gate = out_gate.silu() if ssm.silu_gate else out_gate.sigmoid()
+        z = (self.ssm_norm(core.transpose(1, 2)) * gate).cast(x.dtype).contiguous()
+        return self.ssm_out(z.reshape(B, T, -1))
+
     def _attention(self, x: Tensor, start_pos: Any, idx_mask: Tensor | None = None) -> Tensor:
+        if self.padding is not None:
+            return self._padded(x, start_pos)
         if not self.recording:
             return super()._attention(x, start_pos, idx_mask)
         B, T, _ = x.shape
@@ -83,9 +147,10 @@ class SpecDeltaNetBlock(GatedDeltaNetBlock):  # type: ignore[misc]
         width = weight.shape[1]
         state = self.conv_state
         window = initial.where(0, state).cat(qkv.cast(state.dtype), dim=1).contiguous()  # (B, width - 1 + T, C)
+        # a verify of fewer rows than the buffers were allocated for fills their first part
         conv_stores = (
             state.uop.store(window[:, T : T + state.shape[1]].uop),
-            self.conv_window.uop.store(window.uop),
+            self.conv_window[:, : window.shape[1]].uop.store(window.uop),
         )
         recurrent = self.recurrent_state.uop.after(*conv_stores)
         zs = []
@@ -220,9 +285,86 @@ def attention_blocks(model: Any) -> list[SpecAttentionBlock]:
     return blocks
 
 
+class SpecPLELayer(PLELayer):  # type: ignore[misc]
+    """Qwen3.8-Flash-Next's n-gram embedding layer that, while `recording` is set, keeps its convolution's inputs
+    so a partly rejected verify can put the convolution state back (`restore_from`). The recording path mirrors
+    `PLELayer.__call__` at the pinned commit for a fixed number of rows (re-check on bumps)."""
+
+    recording = False
+    conv_window: Any = None  # (B, hist + T, count * dim): the convolution's previous inputs, then the T rows
+    padding: Any = None  # a padded prefill call (`padded`): (real rows as a bound variable, the checkpoint's row)
+    mid_conv: Any = None  # the convolution state at that row, as `conv_state`
+
+    def allocate(self, rows: int, device: str, batch: int = 1) -> None:
+        """The buffer for verify calls of up to `rows` tokens."""
+        shape = (batch, self.hist + rows, self.count * self.dim)
+        self.conv_window = Tensor.zeros(*shape, device=device).contiguous().realize()
+
+    def allocate_mid(self, device: str, batch: int = 1) -> None:
+        """The buffer for the state at a row inside a padded prefill call."""
+        self.mid_conv = Tensor.zeros(batch, self.hist, self.count * self.dim, device=device).contiguous().realize()
+
+    def __call__(self, x: Tensor, start_pos: Any) -> Tensor:
+        if not self.recording and self.padding is None:
+            return super().__call__(x, start_pos)
+        (B, T), n = x.shape[:2], len(self.ple.multipliers)
+        assert len(start_pos) == 1 and isinstance(T, int), "recording: one fixed-length row"
+        pos = start_pos[0]
+        emb = self.table.read(pos, T, x.device).reshape(B, T, -1).float()
+        s = (self.norm_key(self.key(emb).reshape(x.shape)) * self.norm_query(x)).sum(-1, keepdim=True) * self.dim**-0.5
+        gated = self.value(emb).unsqueeze(2) * (s.sign() * s.abs().clamp(min_=1e-6).sqrt()).sigmoid()
+        state, weight = self.conv_state, self.conv1d["weight"]
+        rows = self.norm_conv(gated).flatten(2).cast(state.dtype)
+        window = Tensor(pos).eq(0).where(0, state).cat(rows, dim=1).contiguous()  # (B, hist + T, count * dim)
+        if self.padding is not None:  # the state after the last real row, and the one at the checkpoint's row
+            real, mid = self.padding
+            stores: tuple[UOp, ...] = (state.uop.store(window[:, real : real + state.shape[1]].uop),)
+            if mid:
+                stores += (self.mid_conv.uop.store(window[:, mid : mid + state.shape[1]].uop),)
+        else:
+            stores = (
+                state.uop.store(window[:, T : T + state.shape[1]].uop),
+                # fewer rows than allocated: the first part
+                self.conv_window[:, : window.shape[1]].uop.store(window.uop),
+            )
+        taps = (window[:, i * n : i * n + T] * weight[:, i] for i in range(weight.shape[1]))
+        conv = functools.reduce(operator.add, taps).silu()
+        return Tensor((gated + conv.reshape(gated.shape)).contiguous().uop.after(*stores))
+
+    def restore_from(self, n: int) -> list[Tensor]:
+        """The assignment that puts back the convolution state after verify row `n` (below rows - 1)."""
+        return [self.conv_state.assign(self.conv_window[:, n + 1 : n + 1 + self.hist])]
+
+
+def ple_layer(ple: Any) -> SpecPLELayer:
+    """Turn the model's n-gram embedding layer into a `SpecPLELayer` (same state and weights)."""
+    ple.__class__ = SpecPLELayer
+    return ple  # type: ignore[no-any-return]
+
+
+class padded:
+    """While tracing a prefill program whose calls may be padded: the first `real` rows (a bound variable) are the
+    prompt's, the rest padding, and the DeltaNet blocks and the n-gram layer leave their state as it is after the
+    last real row, and also keep it as it is after row `mid` - 1 (0: not), where the caller takes a checkpoint
+    (`SpecDeltaNetBlock._padded`, `SpecPLELayer`). The attention layers need nothing: what a padding row writes
+    lies past the prompt's end, is masked out and later overwritten, like a rejected draft's."""
+
+    def __init__(self, blocks: list[Any], real: UOp, mid: int) -> None:
+        self.blocks, self.padding = blocks, (real, mid)
+
+    def __enter__(self) -> None:
+        for b in self.blocks:
+            b.padding = self.padding
+
+    def __exit__(self, *exc: object) -> None:
+        for b in self.blocks:
+            b.padding = None
+
+
 class recording:
-    """While tracing a verify program, DeltaNet blocks record their snapshots and attention blocks attend row by
-    row (`SpecDeltaNetBlock`, `SpecAttentionBlock`)."""
+    """While tracing a verify program, DeltaNet blocks record their snapshots, the n-gram layer its convolution
+    inputs, and full-attention blocks attend row by row (`SpecDeltaNetBlock`, `SpecPLELayer`,
+    `SpecAttentionBlock`)."""
 
     def __init__(self, blocks: list[Any]) -> None:
         self.blocks = blocks

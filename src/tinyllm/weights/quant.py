@@ -64,7 +64,10 @@ _TYPES = [
     _q(34, "TQ1_0", 256, 54, upstream=False),
     _q(35, "TQ2_0", 256, 66, upstream=False),
     _q(39, "MXFP4", 32, 17, packed_kernel=True, small_block=True),
+    _q(40, "NVFP4", 64, 36, upstream=False),
     _q(41, "Q1_0", 128, 18),
+    _q(42, "Q2_0", 64, 18),  # d * (q - 1), q in 0..3; tinyllm adds tinygrad's decoder (tinyllm.tg.kernels.moe_small)
+    _q(43, "F8_E4M3", 1, 1, upstream=False),
 ]
 
 BY_ID: dict[int, QuantType] = {t.id: t for t in _TYPES}

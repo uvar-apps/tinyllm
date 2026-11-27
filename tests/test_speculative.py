@@ -70,3 +70,54 @@ def test_serve_drafts_only_with_an_mtp_block(tmp_path: Path) -> None:
     assert has_mtp(write_gguf(tmp_path / "mtp.gguf", kv, []))
     kv["qwen35.nextn_predict_layers"] = 0
     assert not has_mtp(write_gguf(tmp_path / "plain.gguf", kv, []))
+
+
+def test_serve_finds_an_mtp_block_shipped_apart_from_the_model(tmp_path: Path) -> None:
+    from tinyllm.server.serve import find_mtp
+
+    kv = qwen35_kv()
+    kv["qwen35.nextn_predict_layers"] = 0
+    for folder in ("UD-Q4_K_XL", "MTP"):
+        (tmp_path / "model" / folder).mkdir(parents=True)
+    model = write_gguf(tmp_path / "model" / "UD-Q4_K_XL" / "model.gguf", kv, [])
+    assert find_mtp(model) is None
+    block = {**kv, "qwen35.nextn_predict_layers": 1}
+    other = {k.replace("qwen35", "other"): v for k, v in block.items()} | {"general.architecture": "other"}
+    write_gguf(tmp_path / "model" / "MTP" / "mtp-other-shared-Q8_0.gguf", other, [])  # another architecture
+    write_gguf(tmp_path / "model" / "MTP" / "mtp-model-plain.gguf", kv, [])  # no MTP block
+    assert find_mtp(model) is None
+    full = write_gguf(tmp_path / "model" / "MTP" / "mtp-model-Q8_0.gguf", block, [])
+    assert find_mtp(model) == full
+    small = write_gguf(tmp_path / "model" / "MTP" / "mtp-model-shared-Q4_K_M.gguf", block, [])
+    assert find_mtp(model) == small
+    shared = write_gguf(tmp_path / "model" / "mtp-model-shared-Q8_0.gguf", block, [])
+    assert find_mtp(model) == shared
+
+
+def test_copied_block_source_is_the_longest_then_latest_earlier_occurrence(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`UpstreamSession._copy_source`: the tokens after an earlier occurrence of the text's last tokens. The
+    occurrence that matches furthest back wins, then the latest; one with too few tokens after it does not count."""
+    from types import SimpleNamespace
+
+    from tinyllm.tg import upstream
+
+    monkeypatch.setattr(upstream, "COPY_MATCH", 3)
+    copy = 4
+
+    def source(tokens: list[int]) -> list[int] | None:
+        *text, token = tokens  # `token` is sampled and not yet in the text
+        held = np.zeros(len(text) + copy + 1, dtype=np.int32)
+        held[: len(text)] = text
+        s = SimpleNamespace(copy=copy, pos=len(text), _text=held)
+        found = upstream.UpstreamSession._copy_source(s, token)  # type: ignore[arg-type]
+        return None if found is None else [int(t) for t in found]
+
+    a, b = [1, 2, 3], [7, 8, 9]
+    assert source([*a, 40, 41, 42, 43, 50, 51, *a]) == [40, 41, 42, 43]
+    assert source([*a, 40, 41, 42, 43, 50, 51, 1, 2, 4]) is None  # the last tokens never occurred
+    assert source([*a, 40, 41, 42, 43, *a, 60, 61, 62, 63, 5, *a]) == [60, 61, 62, 63]  # the latest of two
+    # 9 before `a` at the first occurrence and at the end, not at the second: the longer match wins
+    assert source([9, *a, 40, 41, 42, 43, 5, *a, 60, 61, 62, 63, 9, *a]) == [40, 41, 42, 43]
+    assert source([*a, 40, 41, 42, 43, 6, *b, 70, 71, 72, *b]) == [70, 71, 72, 7]  # into the repeat itself
+    assert source([*a, 40, 41, 42, 43, 6, *b, 70, *b]) is None  # the four tokens after `b` would pass the text's end
+    assert source([*a, 40, 41, *a]) is None

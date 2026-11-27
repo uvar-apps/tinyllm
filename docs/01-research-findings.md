@@ -97,7 +97,9 @@ Eight quantization types in one file is normal for these "dynamic" quants, so pe
 
 ### 4.2 Qwen3.8-Flash-Next — architecture `qwen4exp`
 
-48 blocks, width 2,560, 512 experts with 10 active per token plus a shared expert, hyper-connections (4 residual streams), sparse attention through an indexer (top-k 2,048), compressed attention on every 4th block, and hashed per-layer n-gram embeddings (16 tables of about 20 million rows). Same DeltaNet/attention interleave as the 27B. Local Q4 files total about 111 GB. Not run in this study.
+48 blocks, width 2,560, 512 experts with 10 active per token plus a shared expert, hyper-connections (4 residual streams), sparse attention through an indexer (top-k 2,048), compressed attention on every 4th block, and hashed per-layer n-gram embeddings (16 tables of about 20 million rows). Same DeltaNet/attention interleave as the 27B. Local Q4 files total about 111 GB.
+
+Researched in depth on 2026-11-24 in [04-qwen3.8-flash-next.md](04-qwen3.8-flash-next.md). The pinned tinygrad runs `UD-Q4_K_XL` with output identical to llama.cpp b12675, at 6.9 tok/s. After step F1 (the same document, section 11) tinyllm serves both files: 26.6 tok/s on `UD-Q4_K_XL` and 29.3 on `UD-IQ4_XS` at a 4,096 context. Decode slows as the context size grows (20.4 at 32k, from the sparse attention's indexer), and prefill runs at about 100 tok/s. After F5 (section 12 there) prompt reuse works as on the 27B. At an agent's positions (4k to 17k tokens) decode fell to 5–12 tok/s and prefill to 35–60 tok/s, through tinygrad's generic sparse attention. After F2's sparse attention kernels (section 13 there) decode holds 25–27 tok/s from 4k to 20k positions. F3 so far (section 14 there) prefills at 560–800 tok/s, in 2,048-token passes with grouped expert kernels; the target is 1,500.
 
 ### 4.3 Drafters and vision
 

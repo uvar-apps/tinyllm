@@ -12,7 +12,8 @@ Two ways to feed BF16 weights to the matrix cores (`MODE`):
         CPU path for BF16 weights rounds activations to bf16 as well.
   f16   the fp16 instruction, as for the quantized types: each word is converted to two fp16 weights
         (v_cvt_pkrtz_f16_f32), exactly for every weight of magnitude 2^-14 to 65504.
-F16 weights always take the fp16 instruction unchanged.
+F16 weights always take the fp16 instruction unchanged. F32 weights (tinygrad's loader rounds them to fp16) are
+read as fp32 words and rounded to fp16 the same way, for the layers with many outputs (Flash-Next's router).
 
 The kernel reserves 64 KB of local memory per workgroup that it does not need (`RESERVE_LDS`), which limits a
 workgroup processor to two of its workgroups at a time, one wave per SIMD. That helps in two ways (`_config`):
@@ -35,8 +36,8 @@ from tinygrad.helpers import prod
 from tinygrad.llm.kernels.amd import _amd_load, _is_cdna, _is_rdna4
 from tinygrad.llm.kernels.amd_gguf import _wmma_layout, _wmma_words
 
-from tinyllm.tg.kernels.dense import GGML_BF16, GGML_F16
-from tinyllm.tg.kernels.wmma import wmma_linear
+from tinyllm.tg.kernels.dense import GGML_BF16, GGML_F16, GGML_F32
+from tinyllm.tg.kernels.wmma import bind_rows, valid_rows, wmma_linear
 
 ROW_WORDS_PER_BLOCK = 128  # 256 weights of 16 bits
 MIN_ROWS = 16  # fewer rows go to the decode kernel
@@ -83,7 +84,7 @@ def _config(tokens: int, in_features: int, ggml_type: int) -> tuple[int, str]:
     64 KB; chunk 128, 166.6, 35.1 and 22.7. f16 mode with 64 KB: 11.3 and 34.2.
     """
     groups = GROUPS_PER_STEP or 2
-    mode = "f16" if ggml_type == GGML_F16 else MODE or "bf16"
+    mode = "f16" if ggml_type in (GGML_F16, GGML_F32) else MODE or "bf16"
     return (groups if (in_features // 32) % groups == 0 else 1), mode
 
 
@@ -108,6 +109,7 @@ def _dense_wmma_kernel(
     no_weights: bool = False,
     tiles: tuple[int, int] | None = None,
     lds_bytes: int = 0,
+    rows: Any = None,
 ) -> UOp:
     tokens = int(out.shape[0])
     token_tile, output_tiles = tiles if tiles and tokens % tiles[0] == 0 else _tiles(tokens, out_features)
@@ -119,6 +121,10 @@ def _dense_wmma_kernel(
         # a lane's 16 weights (RDNA3) are 8 consecutive words: k = 4 * w + b for w in word_indices, b in 0..3
         if no_weights:
             return UOp.stack(*(UOp.const(0x3C003C00 + k, dtypes.uint32) for k in range(2 * len(word_indices))))
+        if ggml_type == GGML_F32:  # one word a weight, rounded to fp16 as tinygrad's loader rounds it
+            start = base + subgroup * 32 + half * 16
+            loads = [_amd_load(words[start + 4 * i], 4, stream=True) for i in range(4)]
+            return UOp.stack(*(p[j].bitcast(dtypes.float32).cast(dtypes.half) for p in loads for j in range(4)))
         start = base + subgroup * 16 + half * 8
         if kgroups == 1:
             parts, width = [_amd_load(words[start + 4 * i], 4, stream=True) for i in range(2)], 4
@@ -129,7 +135,7 @@ def _dense_wmma_kernel(
             values = [bf16_pair_to_f16(v) for v in values]
         return UOp.stack(*values).bitcast(weight_dtype)  # (n,) words -> (2n,) weights, low half first
 
-    kind = "f16" if ggml_type == GGML_F16 else f"bf16_{mode}"
+    kind = "f16" if ggml_type == GGML_F16 else "f32" if ggml_type == GGML_F32 else f"bf16_{mode}"
     suffix = ("_noweights" if no_weights else "") + (f"_lds{lds_bytes}" if lds_bytes else "")
     name = f"linear_{kind}_wmma_g{groups_per_step}{suffix}"
     return wmma_linear(
@@ -137,7 +143,7 @@ def _dense_wmma_kernel(
         x,
         out_features,
         in_features,
-        ROW_WORDS_PER_BLOCK,
+        2 * ROW_WORDS_PER_BLOCK if ggml_type == GGML_F32 else ROW_WORDS_PER_BLOCK,
         layout,
         dequant,
         name,
@@ -147,6 +153,7 @@ def _dense_wmma_kernel(
         split_blocks=8 % groups_per_step == 0,
         input_dtype=weight_dtype,
         lds_bytes=lds_bytes,
+        rows=rows,
     )
 
 
@@ -165,6 +172,7 @@ def dense_mm_linear(layer: Any, x: Tensor) -> Tensor:
     cdna = _is_cdna(x.device)
     kgroups, lanes = (4, 64) if cdna else (2 if _is_rdna4(x.device) else 1, 32)
     groups, mode = _config(tokens, in_features, ggml_type)
+    rows = valid_rows()
     fxn = functools.partial(
         _dense_wmma_kernel,
         out_features=out_features,
@@ -177,8 +185,9 @@ def dense_mm_linear(layer: Any, x: Tensor) -> Tensor:
         no_weights=NO_WEIGHTS,
         tiles=TILES,
         lds_bytes=RESERVE_LDS if LDS_BYTES is None else LDS_BYTES,
+        rows=rows,
     )
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
     xs = x.cast(dtypes.bfloat16 if mode == "bf16" else dtypes.float16).contiguous()
-    result = Tensor.custom_kernel(out, words, xs, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+    result = Tensor.custom_kernel(out, words, bind_rows(xs, rows), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias

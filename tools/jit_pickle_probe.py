@@ -9,8 +9,9 @@ two captured JIT programs (prefill and decode). `load` starts a fresh process, u
 them, and runs the same prompt without constructing the model at all.
 
 The pickle embeds every buffer the programs touch, weights included, so this is only
-practical as-is for a small model. It answers the question of principle; serving a large
-model this way needs the weights bound from the GGUF file instead (plan item 2f).
+practical as-is for a small model. It answered the question of principle. The server keeps
+its programs between starts with `tinyllm.tg.programs`, which binds them to the buffers of
+the loaded model instead (`tools/program_cache_check.py` checks that).
 """
 
 from __future__ import annotations

@@ -209,7 +209,7 @@ Work
 - **2c. `SlotRunner`.** Bucketed step programs (design 4.5), prefix-compact slots, scratch rows for partially filled buckets.
 - **2d. Scheduler.** Continuous batching, prefill and decode interleaving under a token budget, admission control, deadlines.
 - **2e. State reuse.** Checkpoints of recurrent state, the host-side state store with a byte budget, longest-prefix matching across live slots and stored sequences.
-- **2f. Program cache.** Pickled JIT programs keyed by model hash, tinygrad commit, device and bucket, with weights and state bound from the loaded model instead of embedded in the pickle. Phase 0 showed the principle on the small model: start to first token fell from 16.6 s to 1.4 s, because the warm-up is Python graph rewriting, not compilation.
+- **2f. Program cache.** Pickled JIT programs keyed by model hash, tinygrad commit, device and bucket, with weights and state bound from the loaded model instead of embedded in the pickle. Phase 0 showed the principle on the small model: start to first token fell from 16.6 s to 1.4 s, because the warm-up is Python graph rewriting, not compilation. Built for the phase 1 server on 2026-11-27 (`tinyllm.tg.programs`; docs/04-qwen3.8-flash-next.md, section 16): Flash-Next is ready 65 s after launch instead of 1,390, the 27B after 24 to 29 s instead of 150 to 180.
 
 Exit criteria
 
@@ -281,7 +281,7 @@ Work
 - **4d. Dense F16/BF16.** Moved to phase 0B; what remains here is tuning it further with the autotuner.
 - **4e. Startup.** Parallel direct-I/O weight loading; investigation of zero-copy mapping on unified memory; load-time repack cache.
 - **4f. Long context.** 8-bit KV cache option; attention kernel behaviour beyond 100k tokens.
-- **4g. Qwen3.8-Flash-Next.** The `qwen4exp` architecture (512-expert MoE, indexer, compressed attention, host-mapped n-gram embeddings) on the slot engine.
+- **4g. Qwen3.8-Flash-Next.** The `qwen4exp` architecture (512-expert MoE, indexer, compressed attention, host-mapped n-gram embeddings) on the slot engine. Research and the step plan (F1 to F5): [04-qwen3.8-flash-next.md](04-qwen3.8-flash-next.md). F1 (both files correct and served) done 2026-11-24; F5 (prompt reuse) and F2's sparse attention done 2026-11-25; F3 (prefill) in progress: about 650–800 tok/s against the 1,500 target.
 - **4h. Accuracy audit.** Perplexity and logit divergence of the integer-activation decode path against a float reference, per quantization type.
 
 Exit criteria
@@ -338,7 +338,8 @@ Exit criteria: the same oracle and API test suites pass on each platform, with a
    fixed K of 3. Needs a cycle program per K (about 15 s of compiling each) or one program that skips the MTP steps
    past a low-confidence draft.
 4. Start-up: compiling the 27B's programs takes 94 seconds (about 140 with the speculative cycle); pickled programs
-   with the weights bound from the GGUF at load (item 2f) would remove most of it. With fixed-length chunks the first prompt whose length is not a multiple of
+   with the weights bound from the GGUF at load (item 2f) would remove most of it. Done 2026-11-27: the server keeps
+   its programs between starts and a start that loads them compiles nothing. With fixed-length chunks the first prompt whose length is not a multiple of
    the chunk compiles the variable-length program on first use; the phase 1 server should compile both at start.
 5. Long context (coding work, research findings 5.10). Decoding and the verify share a split-K attention kernel on
    the matrix cores, bit-exact with each other and more accurate than upstream's. A block reads each cache tile

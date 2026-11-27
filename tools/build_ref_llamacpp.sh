@@ -11,7 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${TINYLLM_REF_DIR:-$ROOT/.ref}/llama.cpp"
-TAG="${LLAMACPP_TAG:-b12629}"
+TAG="${LLAMACPP_TAG:-b12675}"  # b12675: Q2_0 tensors (unsloth UD-IQ4_XS of Qwen3.8-Flash-Next)
 
 if [ ! -d "$DEST/.git" ]; then
   mkdir -p "$(dirname "$DEST")"

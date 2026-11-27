@@ -27,7 +27,15 @@ from tinygrad.helpers import prod
 from tinygrad.llm.kernels.amd import _is_cdna, _is_rdna4
 from tinygrad.llm.kernels.amd_gguf import Q4_K, Q5_K, QUANT_SIZES, _half, _q5_scales, _wmma_words
 
-from tinyllm.tg.kernels.wmma import center_affine, magic_pairs, splat_half, wmma_layout, wmma_linear
+from tinyllm.tg.kernels.wmma import (
+    bind_rows,
+    center_affine,
+    magic_pairs,
+    splat_half,
+    valid_rows,
+    wmma_layout,
+    wmma_linear,
+)
 
 QS_WORD = {Q4_K: 4, Q5_K: 12}  # first word of the 4-bit codes in a super-block
 QH_WORD = 4  # Q5_K: first word of the fifth bits
@@ -98,6 +106,7 @@ def _q45k_wmma_kernel(
     tiles: tuple[int, int] | None = None,
     shared: tuple[int, int, int] | None = None,
     prefetch: bool = False,
+    rows: Any = None,
 ) -> UOp:
     tokens = int(out.shape[0])
     # tinygrad's tiling for these types (_q5_linear_f16_wmma_kernel)
@@ -196,6 +205,7 @@ def _q45k_wmma_kernel(
         lds_bytes=lds_bytes,
         share_inputs=shared is not None,
         prefetch=(fetch, convert) if prefetch and not no_weights else None,
+        rows=rows,
     )
 
 
@@ -225,6 +235,7 @@ def q45k_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]
     cdna = _is_cdna(x.device)
     kgroups, lanes = (4, 64) if cdna else (2 if _is_rdna4(x.device) else 1, 32)
     groups, packed = _config(tokens, in_features, int(layer.ggml_type))
+    rows = valid_rows()
     fxn = functools.partial(
         _q45k_wmma_kernel,
         out_features=out_features,
@@ -239,8 +250,11 @@ def q45k_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]
         tiles=TILES,
         shared=SHARED,
         prefetch=PREFETCH,
+        rows=rows,
     )
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
     xs = x.cast(dtypes.float16).contiguous()  # exactly tinygrad's form, see q8.py
-    result = Tensor.custom_kernel(out, layer.weight, xs, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+    result = Tensor.custom_kernel(out, layer.weight, bind_rows(xs, rows), fxn=fxn)[0].reshape(
+        *x.shape[:-1], out_features
+    )
     return result if layer.bias is None else result + layer.bias

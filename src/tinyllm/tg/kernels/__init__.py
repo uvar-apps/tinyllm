@@ -8,6 +8,10 @@
   q6k       Q6_K weights, prefill only; decode stays on tinygrad's kernel (q6k.py)
   q8        Q8_0 weights, prefill only; decode stays on tinygrad's kernel (q8.py)
   attention one-token attention on the matrix cores, and the speculative verify with it (decode_mma.py)
+  moe       expert layers stored as Q5_0, Q5_1 or Q2_0 (moe_small.py)
+  moe_mm    expert layers in prefill, grouped by expert on the matrix cores (moe_mm.py)
+  qsa       Qwen3.8-Flash-Next's sparse attention: block keys, exact top-k selection, paged attention (qsa.py)
+  hc        Qwen3.8-Flash-Next's gated residual in prefill: stream norm and inject gates in one kernel (hc.py)
 
 They follow the structure of tinygrad's kernels in `tinygrad/llm/kernels` and reuse its helpers,
 so they are tied to the pinned tinygrad commit like everything else under `tinyllm.tg`.

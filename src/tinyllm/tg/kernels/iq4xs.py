@@ -49,7 +49,7 @@ from tinygrad.llm.kernels.amd_gguf import (
     q8_quantize,
 )
 
-from tinyllm.tg.kernels.wmma import scale_pair, splat_half, wmma_linear
+from tinyllm.tg.kernels.wmma import bind_rows, scale_pair, splat_half, valid_rows, wmma_linear
 
 QS_WORD = 2  # first word of the codes in a super-block
 HALF_SELECTORS = (0x05040100, 0x07060302)  # v_perm_b32: the low (then high) fp16 values of two table entries
@@ -114,6 +114,7 @@ def _iq4xs_wmma_kernel(
     no_weights: bool = False,
     lds_bytes: int = 0,
     tiles: tuple[int, int] | None = None,
+    rows: Any = None,
 ) -> UOp:
     token_tile, output_tiles = _tiles(int(out.shape[0]), out_features)
     if tiles is not None and int(out.shape[0]) % tiles[0] == 0:
@@ -160,6 +161,7 @@ def _iq4xs_wmma_kernel(
         groups_per_step,
         split_blocks=8 % groups_per_step == 0,
         lds_bytes=lds_bytes,
+        rows=rows,
     )
 
 
@@ -223,6 +225,7 @@ def iq4xs_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor
     cdna = _is_cdna(x.device)
     kgroups, lanes = (4, 64) if cdna else (2 if _is_rdna4(x.device) else 1, 32)
     groups, packed = _config(tokens, in_features)
+    rows = valid_rows()
     fxn = functools.partial(
         _iq4xs_wmma_kernel,
         out_features=out_features,
@@ -234,9 +237,12 @@ def iq4xs_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor
         no_weights=NO_WEIGHTS,
         lds_bytes=RESERVE_LDS if LDS_BYTES is None else LDS_BYTES,
         tiles=TILES,
+        rows=rows,
     )
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
     xs = x.cast(dtypes.float16).contiguous()  # exactly tinygrad's form, see q8.py
     table = iq4_half_lut(x.device)
-    result = Tensor.custom_kernel(out, layer.weight, xs, table, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+    result = Tensor.custom_kernel(out, layer.weight, bind_rows(xs, rows), table, fxn=fxn)[0].reshape(
+        *x.shape[:-1], out_features
+    )
     return result if layer.bias is None else result + layer.bias

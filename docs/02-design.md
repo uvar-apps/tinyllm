@@ -156,7 +156,7 @@ Initial buckets, chosen to match the kernel regimes measured on this machine:
 | verify | (1,8), later (2,4) | same, logits at every position |
 | prefill | (1,128) for one prompt, (4,32) for concurrent prompts; a smaller chunk when decode rows are waiting, since a pass blocks them for its whole duration | FP16 matrix-multiply cores with in-kernel dequantization |
 
-Programs are compiled on first use and kept. Compiled programs are pickled to disk, keyed by model file hash, tinygrad commit, device and bucket, so later starts skip JIT capture (F7).
+Programs are compiled on first use and kept. Compiled programs are pickled to disk, keyed by model file hash, tinygrad commit, device and bucket, so later starts skip JIT capture (F7). The phase 1 server does this for its whole set of programs at once (`tinyllm.tg.programs`: one file per model and settings, keyed by the model files' names, sizes and times and by the sources of tinygrad and `tinyllm/tg`).
 
 `Runner` is an interface. Phase 1 ships `UpstreamRunner`, an adapter over `tinygrad.llm`'s model class with one stream, to get a working server immediately. Phase 2 adds `SlotRunner` with our own model graphs. The engine does not change between them.
 

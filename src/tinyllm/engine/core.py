@@ -75,6 +75,7 @@ class _Active:
     prefill_seconds: float = 0.0
     last: int | None = None  # the last sampled token, still to be fed
     device: bool = False  # decode samples on the device (runner.feed_sampled)
+    copied: int = 0  # tokens that came from blocks copied from earlier text (runner.last_drafted)
 
 
 class Engine:
@@ -90,6 +91,8 @@ class Engine:
         self.device_sampling = device_sampling  # sample on the device when the runner can and the settings allow
         # draft-and-verify cycles (tinyllm.tg.speculative) for device-sampled requests, when the runner has them
         self.speculative = int(getattr(runner, "speculative", 0)) if speculative else 0
+        # rows of sampler settings a cycle takes: more than K + 1 when the runner also verifies copied blocks
+        self.speculative_rows = int(getattr(runner, "speculative_rows", self.speculative + 1))
         self.max_waiting = max_waiting
         self.prefill_slice = prefill_slice  # prompt tokens per engine step; a multiple of the runner's chunk
         self.metrics = Metrics()
@@ -179,7 +182,10 @@ class Engine:
                 device = (
                     self.device_sampling and request.params.device_ok and getattr(self.runner, "device_sampling", False)
                 )
-                self._active = _Active(request, sink, sampler, now, cached=cached, fed=cached, device=device)
+                # `cached` is where the prompt is fed from; a runner that also skips later stretches says how
+                # many tokens it reuses in all
+                reused = getattr(self.runner, "reused", cached)
+                self._active = _Active(request, sink, sampler, now, cached=reused, fed=cached, device=device)
                 self.metrics.running = 1
                 return
 
@@ -207,12 +213,15 @@ class Engine:
                     self._finish(a, "length")
                     return
                 k = self.speculative
-                if a.device and k and a.fed + k + 1 < self.runner.max_context:
+                if a.device and k and a.fed + self.speculative_rows < self.runner.max_context:
                     # one draft-and-verify cycle: the last token and the drafts the main model agreed with go in,
                     # and the main model's own tokens at those rows come out (n accepted drafts and one more)
-                    rows, n = self.runner.feed_speculative(a.last, a.sampler.device_rows(k + 1))
+                    rows, n = self.runner.feed_speculative(a.last, a.sampler.device_rows(self.speculative_rows))
                     a.fed += n + 1
-                    self.metrics.record_cycle(k, n)
+                    drafted = int(getattr(self.runner, "last_drafted", k))  # K, or a copied block's drafts
+                    self.metrics.record_cycle(drafted, n)
+                    if drafted != k:
+                        a.copied += n
                     for j in range(n + 1):
                         self._emit(a, a.sampler.from_device(rows[j]))
                         if self._active is not a:  # finished: an end token, max_tokens or the context
@@ -290,12 +299,13 @@ class Engine:
             decode=decode_seconds if a.first_token_at is not None else None,
         )
         log.info(
-            "%s %s prompt %d (cached %d) out %d  queue %.2fs  ttft %s  prefill %s tok/s  decode %s tok/s",
+            "%s %s prompt %d (cached %d) out %d%s  queue %.2fs  ttft %s  prefill %s tok/s  decode %s tok/s",
             r.id,
             reason,
             len(r.prompt),
             a.cached,
             a.generated,
+            f" (copied {a.copied})" if a.copied else "",
             event.queue_seconds,
             f"{event.first_token_seconds:.2f}s" if event.first_token_seconds is not None else "-",
             f"{event.prefill_tokens_per_second:.0f}" if event.prefill_tokens_per_second else "-",

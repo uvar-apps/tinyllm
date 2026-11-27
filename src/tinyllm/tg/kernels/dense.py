@@ -30,7 +30,7 @@ from tinygrad.llm.kernels.amd import _amd_load, warp_reduce
 from tinygrad.llm.kernels.amd_gguf import _half
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
-GGML_F16, GGML_BF16 = 1, 30
+GGML_F32, GGML_F16, GGML_BF16 = 0, 1, 30
 MAX_TOKEN_TILE = 8  # rows of activations served by one read of the weights
 MAX_WAVES = 8  # waves per workgroup, which share one copy of the activations
 CHUNK = 1024  # inputs per workgroup
@@ -75,6 +75,31 @@ def find_dense(decoded: Tensor) -> tuple[int, Tensor] | None:
     if offset is None or offset % 4 or raw.buf_uop.dtype != dtypes.uint8:
         return None
     return ggml_type, Tensor(raw).flatten().bitcast(dtypes.uint32).contiguous()
+
+
+def find_f32(decoded: Tensor) -> tuple[int, Tensor] | None:
+    """(GGML_F32, the weights' fp32 bits as uint32 words) if `decoded` is exactly an F32 GGUF tensor, possibly
+    cast (tinygrad's loader casts it to fp16): a zero-copy view of the model file's buffer, row-major."""
+    n = decoded.numel()
+    if decoded.uop.axis is not None or not isinstance(n, int):
+        return None
+    raw = next(
+        (
+            u
+            for u in decoded.uop.toposort()
+            if u.op in (Ops.SHRINK, Ops.BUFFER) and u.dtype == dtypes.uint8 and prod(u.shape) == 4 * n
+        ),
+        None,
+    )
+    if (
+        raw is None
+        or _unwrapped(ggml_data_to_tensor(Tensor(raw).flatten(), n, GGML_F32).uop).key != _unwrapped(decoded.uop).key
+    ):
+        return None
+    offset = raw.contiguous_view_offset()
+    if offset is None or offset % 4 or raw.buf_uop.dtype != dtypes.uint8:
+        return None
+    return GGML_F32, Tensor(raw).flatten().bitcast(dtypes.uint32).contiguous()
 
 
 @functools.cache

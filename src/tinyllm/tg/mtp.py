@@ -18,12 +18,15 @@ llama.cpp's convention of index i + 1.
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Iterator
+from dataclasses import replace
 from typing import Any
 
-from tinygrad import Tensor, dtypes, nn
+from tinygrad import Device, Tensor, dtypes, nn
+from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.llm.kernels.amd import Linear
-from tinygrad.llm.model import Transformer, TransformerBlock
+from tinygrad.llm.model import GatedResidual, GroupedRMSNorm, Transformer, TransformerBlock
 
 
 class _NextN:
@@ -45,6 +48,10 @@ class MTPBlock(TransformerBlock):  # type: ignore[misc]
         x = self.nextn.eh_proj(self.nextn.enorm(e).cat(self.nextn.hnorm(h.float()), dim=-1))
         x, _ = self(x, start_pos, None, tokens)
         return self.nextn.shared_head_norm(x)
+
+    def head(self, x: Tensor) -> Tensor:
+        """What the output head reads: `hidden`'s result as it is."""
+        return x
 
 
 def quantize_q4_0(weight: Tensor, step: int | None = None) -> Tensor:
@@ -119,3 +126,75 @@ def load(path: str, max_context: int | None, realize: bool) -> tuple[Transformer
             p.replace(p.contiguous())
         Tensor.realize(*params)
     return model, kv, block
+
+
+class _StreamNextN:
+    """`nextn` of a model with residual streams: the projection (applied per stream) and the head's mixer."""
+
+    def __init__(self, config: Any) -> None:
+        dim, count = config.dim, config.hc.count
+        self.eh_proj = Linear(2 * dim, dim, bias=False)
+        self.enorm = nn.RMSNorm(dim, config.norm_eps)
+        self.hnorm = GroupedRMSNorm(count, dim, config.norm_eps)
+        self.hc_head = GatedResidual(config, inject=False)
+
+
+class StreamMTPBlock(TransformerBlock):  # type: ignore[misc]
+    """Qwen3.8-Flash-Next's MTP block (llama.cpp b12675, `src/models/qwen4exp.cpp`, `graph_mtp`): one sparse-attention
+    layer of the main architecture, with its own experts, caches and residual mixers, fed per stream by
+
+        x_s = eh_proj(concat(enorm(embed(token)), hnorm(h)_s))    # h: the main model's streams before its final mixer
+
+    Its streams are the next draft step's h; the token comes from the main model's head over `head(x)`, the block's
+    own final mixer. The block ships in a GGUF of its own (`load_streams`)."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(replace(config, ple=None))
+        self.nextn = _StreamNextN(config)
+
+    def hidden(self, model: Any, tokens: Tensor, h: Tensor, start_pos: tuple[Any, ...]) -> Tensor:
+        """The block's streams (B, T, count, D) for `tokens` (B, T) paired with the main model's streams `h`."""
+        B, T, count, dim = h.shape
+        e = model.token_embd(tokens.to(model.token_embd.weight.device)).float()
+        en = self.nextn.enorm(e).unsqueeze(2).expand(B, T, count, dim)
+        x = en.cat(self.nextn.hnorm(h.float()), dim=-1).reshape(B, T * count, 2 * dim)
+        x = self.nextn.eh_proj(x).reshape(B, T, count, dim)
+        x, _ = self(x, start_pos, None, tokens)
+        return x
+
+    def head(self, x: Tensor) -> Tensor:
+        """What the output head reads: the block's streams (B, T, count, D) mixed into one (B, T, D)."""
+        return self.nextn.hc_head.mix(x)[0]
+
+
+def load_streams(model: Any, path: str, realize: bool) -> StreamMTPBlock:
+    """The MTP block of a model with residual streams from its own GGUF (`mtp-*.gguf`: one block after the main
+    model's, with or without the embedding and head it shares with the main model)."""
+    kv, entries = gguf_parse(path)
+    arch = kv["general.architecture"]
+    if int(kv.get(f"{arch}.nextn_predict_layers", 0)) != 1:
+        raise ValueError(f"{path} carries no MTP block")
+    prefix = f"blk.{model.config.num_blocks}."
+    state = gguf_shard({k: v for k, v in entries.items() if k.startswith(prefix)}, (Device.DEFAULT,))
+    weights = {}
+    for key, value in state.items():  # the names `Transformer.from_gguf` gives a block's tensors (pinned commit)
+        name = re.sub(r"^(hc_attn|hc_ffn)_", r"\1.", key[len(prefix) :])
+        name = re.sub(r"^nextn\.hc_head_", "nextn.hc_head.", name)
+        name = name.replace("indexer.q_proj", "indexer.attn_q_b").replace("indexer.k_proj", "indexer.attn_k")
+        weights[name] = value.cast("float16") if dtypes.is_float(value.dtype) else value
+    if not weights:
+        raise ValueError(f"{path} has no tensors of block {model.config.num_blocks}")
+    block = StreamMTPBlock(model.config)
+    nn.state.load_state_dict(block, weights, verbose=False, consume=True, realize=False)
+    if weights:
+        raise ValueError(f"{path}: tensors the MTP block has no place for: {sorted(weights)[:5]}")
+    # the mixers' inject weights (count x count * dim) as float32, as the main model's file stores its own: the
+    # mixer kernel reads them as a matrix (tinyllm.tg.kernels.hc), which a quantized layer's packed words are not
+    for mixer in (block.hc_attn, block.hc_ffn):
+        mixer.inject.weight = mixer.inject.weight.float().contiguous().realize()
+    if realize:
+        params = nn.state.get_parameters(block)
+        for p in params:
+            p.replace(p.contiguous())
+        Tensor.realize(*params)
+    return block

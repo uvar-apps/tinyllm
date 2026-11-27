@@ -12,15 +12,42 @@ Tiling, fragment layout and the final exchange of accumulators are tinygrad's (`
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
+from typing import Any
 
-from tinygrad import UOp, dtypes
+from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace, DType
-from tinygrad.llm.kernels.amd import WMMA_ARG, _amd_load
+from tinygrad.llm.kernels.amd import WMMA_ARG, _amd_load, _unbind
 from tinygrad.llm.kernels.amd_gguf import _amd_byte_perm, _wmma_layout, _wmma_stores, _wmma_words
 from tinygrad.uop.ops import AxisType, KernelInfo
 
 Dequant = Callable[[UOp, UOp, int], tuple[UOp, ...] | UOp]
+_valid_rows: list[Any] = [None]  # set by the kernel hook around a symbolic chunk's call (`padded_rows`)
+SKIP_PADDED_ROWS = True  # False computes the padding rows too (for checks)
+
+
+@contextlib.contextmanager
+def padded_rows(rows: Any) -> Iterator[None]:
+    """While a symbolic chunk of `rows` valid rows runs at its padded length: the kernels built meanwhile skip the
+    token blocks past `rows` (`valid_rows`)."""
+    _valid_rows.append(rows if SKIP_PADDED_ROWS else None)
+    try:
+        yield
+    finally:
+        _valid_rows.pop()
+
+
+def valid_rows() -> Any:
+    """The valid rows of the symbolic chunk being built (a bound variable), or None for a whole static chunk."""
+    return _valid_rows[-1]
+
+
+def bind_rows(t: Tensor, rows: Any) -> Tensor:
+    """`t` carrying the binding of `rows` into the graph, so the kernel that reads it gets its value."""
+    return Tensor(t.uop.after(rows)) if isinstance(rows, UOp) else t
+
+
 NO_INPUTS = False  # diagnostic: constant activations, no activation loads. Wrong results; shows what loads cost.
 SHARED_PAD = 8  # elements of padding per row of a shared activation tile, against local-memory bank conflicts
 # experiments: C statements placed at the end of the loop body, for the compiler's scheduling hints, e.g.
@@ -172,7 +199,7 @@ def wmma_linear(
     in_features: int,
     type_words: int,
     layout: tuple,  # type: ignore[type-arg]
-    dequant: Dequant,
+    dequant: Dequant | tuple[Dequant, ...],
     name: str,
     kgroups: int,
     lanes: int,
@@ -181,8 +208,14 @@ def wmma_linear(
     input_dtype: DType = dtypes.float16,
     lds_bytes: int = 0,
     share_inputs: bool = False,
-    prefetch: tuple[Callable[[UOp, UOp, int], list[UOp]], Callable[[list[UOp], UOp, int], UOp]] | None = None,
+    prefetch: tuple[Any, Any] | None = None,
     schedule: str | None = None,
+    x_rows: int | None = None,
+    steps: UOp | None = None,
+    estimates: Any = None,
+    rows: Any = None,
+    input_row: Callable[[UOp], UOp] | None = None,
+    stores: Callable[..., list[UOp]] | None = None,
 ) -> UOp:
     """out[token, output] = x @ W.T on the matrix cores; `dequant(base, subgroup, half)` gives a lane's weights
     (16 on RDNA3) in `input_dtype` (fp16, or bf16 for the bf16 matrix instruction), as scalars or one vector.
@@ -209,6 +242,21 @@ def wmma_linear(
     `schedule` is C placed at the end of the loop body, for the compiler's scheduling hints (`SCHEDULE`, if set,
     replaces it in every kernel).
 
+    `x_rows` is the number of rows of `x` when the layout's rows are not out's (grouped experts gather them).
+
+    `rows` is the number of valid rows of a symbolic chunk computed at its padded length (`valid_rows`): token
+    blocks wholly past it run no step (their garbage rows are sliced off).
+
+    `input_row(r)` maps row r (0 .. token tile - 1) of the tile to its row of `x`, for `share_inputs` with gathered
+    rows (grouped experts); by default a tile's rows are consecutive rows of `x`.
+
+    `dequant` may be a sequence, one per output tile (two weight matrices for the same outputs). `stores` replaces
+    the final stores: stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups) -> stores.
+
+    `steps` replaces the loop's trip count (in_features // 32 // groups_per_step), for a workgroup that has no
+    work (0 steps). A trip count read from memory needs `estimates` too: tinygrad's own cost estimate cannot be
+    evaluated then, so the kernel carries these and skips tinygrad's optimizer passes (`KernelInfo(optimized=True)`).
+
     With `share_inputs`, two buffers alternate: while a step computes from one, its
     threads load the next step's activations and write them to the other, so the load latency overlaps the step
     and one barrier per step suffices. RDNA3 fragment layout only (kgroups 1).
@@ -218,7 +266,7 @@ def wmma_linear(
         raise ValueError(f"{in_features} inputs are not a whole number of steps of {G} groups")
     if split_blocks and 8 % G:
         raise ValueError(f"split_blocks needs a number of groups per step dividing 8, not {G}")
-    x = x.reshape(out.shape[0], in_features)
+    x = x.reshape(x_rows or out.shape[0], in_features)
     output_waves, token_block, output_block, lane, wave, lane_group, outputs, input_tokens, tokens = layout
     token_tile, output_tiles = len(tokens) * 16, len(outputs)
     output_words = in_features * type_words // 256
@@ -227,7 +275,9 @@ def wmma_linear(
         for _ in range(output_tiles)
     )
     accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
-    step = UOp.range(in_features // 32 // G, 4)
+    if steps is None and rows is not None:
+        steps = (token_block * token_tile < _unbind(rows)).where(in_features // 32 // G, 0)
+    step = UOp.range(in_features // 32 // G if steps is None else steps, 4)
     wmma_accs = [list(output_accs) for output_accs in accs]
     ks = tuple(word * 4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
     a_tile = a_next = None
@@ -252,7 +302,8 @@ def wmma_linear(
 
         def fetch(j: int, at_step: UOp | int) -> UOp:
             row, column = place(j)
-            return _amd_load(x[token_block * token_tile + row, at_step * width + column], 8)
+            x_row = token_block * token_tile + row if input_row is None else input_row(row)
+            return _amd_load(x[x_row, at_step * width + column], 8)
 
         def write(target: UOp, buffer: UOp | int, j: int, values: UOp) -> list[UOp]:
             row, column = place(j)
@@ -268,17 +319,21 @@ def wmma_linear(
     col = lane % 16
     held_words: dict[tuple[int, int, int], UOp] = {}
     if prefetch is not None:
-        fetch_words = prefetch[0]
         last = in_features // 32 // G - 1
 
-        def raw_words(at_step: UOp | int, g: int, half: int, output: UOp) -> list[UOp]:
+        def pick(fns: Any, output_tile: int) -> Any:  # one function for all output tiles, or one per tile
+            return fns[output_tile] if isinstance(fns, (list, tuple)) else fns
+
+        def raw_words(at_step: UOp | int, g: int, half: int, output: UOp, output_tile: int = 0) -> list[UOp]:
             group = at_step * G + g
-            return fetch_words(output * output_words + (group // 8) * type_words, group % 8, half)
+            fetch_words = pick(prefetch[0], output_tile)
+            words: list[UOp] = fetch_words(output * output_words + (group // 8) * type_words, group % 8, half)
+            return words
 
         for g in range(G):
             for half in range(2):
                 for output_tile, output in enumerate(outputs):
-                    words = raw_words(0, g, half, output)
+                    words = raw_words(0, g, half, output, output_tile)
                     reg = UOp.alloc((len(words),), dtypes.uint32, addrspace=AddrSpace.REG)
                     held_words[(g, half, output_tile)] = reg.after(reg.store(UOp.stack(*words)))
     prefetch_stores: list[UOp] = []
@@ -315,12 +370,15 @@ def wmma_linear(
                 if prefetch is not None:
                     reg = held_words[(g, half, output_tile)]
                     current = reg.after(step)
-                    frag = prefetch[1]([current[i].load() for i in range(int(reg.shape[0]))], subgroup, half)
-                    upcoming = raw_words((step + 1) % (last + 1), g, half, output)  # the last step re-reads step 0
+                    convert = pick(prefetch[1], output_tile)
+                    frag = convert([current[i].load() for i in range(int(reg.shape[0]))], subgroup, half)
+                    # the last step re-reads step 0
+                    upcoming = raw_words((step + 1) % (last + 1), g, half, output, output_tile)
                     read = frag if isinstance(frag, tuple) else (frag,)  # this step's words are used first
                     prefetch_stores.append(reg.after(*read).store(UOp.stack(*upcoming)))
                 else:
-                    frag = dequant(output * output_words + block * type_words, subgroup, half)
+                    dq = dequant[output_tile] if isinstance(dequant, (list, tuple)) else dequant
+                    frag = dq(output * output_words + block * type_words, subgroup, half)
                 bfrag = frag if isinstance(frag, UOp) else UOp.stack(*frag)
                 for tile, afrag in enumerate(afrags):
                     previous = accs[output_tile][tile].after(step) if first else wmma_accs[output_tile][tile]
@@ -352,7 +410,13 @@ def wmma_linear(
         *prefetch_stores,
         *hints,
     ).end(step)
-    stores = wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups, lds_bytes)
-    return (
-        UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+    if stores is None:
+        stored = wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups, lds_bytes)
+    else:
+        stored = stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups)
+    info = (
+        KernelInfo(name=name, opts_to_apply=())
+        if estimates is None
+        else KernelInfo(name=name, opts_to_apply=(), estimates=estimates, optimized=True)
     )
+    return UOp.group(*stored).end(token_block, output_block, lane, wave).sink(arg=info)

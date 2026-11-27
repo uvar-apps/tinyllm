@@ -23,7 +23,17 @@ from tinygrad.helpers import prod
 from tinygrad.llm.kernels.amd import _is_cdna, _is_rdna4
 from tinygrad.llm.kernels.amd_gguf import Q8_0, QUANT_SIZES, _load_u32, _wmma_words
 
-from tinyllm.tg.kernels.wmma import FP16_1024, byte_pairs, center_scale, splat_half, wmma_layout, wmma_linear
+from tinyllm.tg.kernels import gemm
+from tinyllm.tg.kernels.wmma import (
+    FP16_1024,
+    bind_rows,
+    byte_pairs,
+    center_scale,
+    splat_half,
+    valid_rows,
+    wmma_layout,
+    wmma_linear,
+)
 
 BLOCK_HALFWORDS = 17  # 34 bytes per 32 weights
 OFFSET = 1024 + 128
@@ -35,6 +45,7 @@ LDS_BYTES: int | None = None  # experiments: local memory reserved per workgroup
 TILES: tuple[int, int] | None = None  # experiments: (token tile, output tiles per wave) instead of the default
 SHARED: tuple[int, int, int] | None = None  # experiments: (token tile, output tiles, waves), activations shared
 PREFETCH = False  # experiments: weights loaded one step ahead (wmma_linear(prefetch=...))
+GEMM = True  # calls of whole 128-row blocks go to the tiled kernel (gemm.py)
 # The compiler's own interleaving strategy for matrix loops, above 32 rows (`_config`); None to leave it out.
 HINT_ABOVE_32: str | None = "__builtin_amdgcn_iglp_opt(1);"
 RESERVE_LDS = 24576  # local memory reserved per workgroup to limit occupancy (wmma.wmma_stores); `_config`
@@ -99,6 +110,7 @@ def _q8_wmma_kernel(
     shared: tuple[int, int, int] | None = None,
     prefetch: bool = False,
     schedule: str | None = None,
+    rows: Any = None,
 ) -> UOp:
     tokens = int(out.shape[0])
     token_tile, output_tiles = 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else 16, 2
@@ -177,6 +189,7 @@ def _q8_wmma_kernel(
         share_inputs=shared is not None,
         prefetch=(fetch, convert) if prefetch and not no_weights else None,
         schedule=schedule,
+        rows=rows,
     )
 
 
@@ -194,9 +207,12 @@ def q8_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]) 
     tokens = int(prod(x.shape[:-1]))
     if tokens % 16 or out_features % 16:
         return fallback(layer, x)
+    if GEMM and gemm.serves(layer, x, Q8_0):  # large prefill calls: the tiled kernel
+        return gemm.gemm_linear(layer, layer.weight, Q8_0, x)
     cdna = _is_cdna(x.device)
     kgroups, lanes = (4, 64) if cdna else (2 if _is_rdna4(x.device) else 1, 32)
     groups, packed = _config(tokens, in_features)
+    rows = valid_rows()
     fxn = functools.partial(
         _q8_wmma_kernel,
         out_features=out_features,
@@ -211,10 +227,13 @@ def q8_linear(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]) 
         shared=SHARED,
         prefetch=PREFETCH,
         schedule=HINT_ABOVE_32 if tokens > 32 else None,
+        rows=rows,
     )
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
     # exactly tinygrad's form (no reshape first): layers sharing an input then share one fp16 copy of it, so
     # mixing these kernels with tinygrad's does not change how the producer of that input is scheduled
     xs = x.cast(dtypes.float16).contiguous()
-    result = Tensor.custom_kernel(out, layer.weight, xs, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+    result = Tensor.custom_kernel(out, layer.weight, bind_rows(xs, rows), fxn=fxn)[0].reshape(
+        *x.shape[:-1], out_features
+    )
     return result if layer.bias is None else result + layer.bias

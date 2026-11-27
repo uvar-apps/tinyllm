@@ -81,7 +81,7 @@ def main() -> int:
         same = np.array_equal(many, ones)
         failures += not same
         err_mma, err_up = float(np.abs(many - ref).max()), float(np.abs(ups - ref).max())
-        worst_mma, worst_upstream = max(worst_mma, err_mma), max(worst_upstream, err_up)
+        worst_mma, worst_upstream = np.maximum(worst_mma, err_mma), np.maximum(worst_upstream, err_up)  # NaN propagates
         across = "same" if same else f"FAIL across row counts (max diff {np.abs(many - ones).max():.3g})"
         print(
             f"tinyllm decode mma, {M} rows at {p + 1}..{p + M}: {across}; "
