@@ -137,6 +137,57 @@ def test_programs_are_not_loaded_from_a_file_others_can_write_and_not_saved_with
     assert not (tmp_path / "second").exists() or not any((tmp_path / "second").rglob("programs.pkl"))
 
 
+def test_a_program_is_captured_by_its_first_call_once_another_of_its_function_is(tmp_path: Path) -> None:
+    from tinyllm.tg import Tensor
+
+    def x(value: float) -> Any:
+        return Tensor(np.full((1, 4), value, dtype=np.float32)).contiguous().realize()
+
+    want = _Session(tmp_path / "plain").run(3)  # one program, built in two calls
+    s = _Session(tmp_path / "early")
+    other = s.programs.jit("step again", s._step, s.step)  # the same function: nothing left for a first call to make
+    got = [s.step(x(1)).numpy().copy(), s.step(x(2)).numpy().copy()]
+    assert s.step.cnt == 2 and s.step.linears == 1 and not s.step.early
+    got.append(other(x(3)).numpy().copy())
+    assert other.early and not other.again and other.cnt == 2 and other.captured is not None
+    assert all(np.array_equal(a, b) for a, b in zip(want, got, strict=True))
+    assert np.array_equal(other(x(4)).numpy(), _Session(tmp_path / "plain").run(4)[3])  # and it replays
+
+    early = s.programs.jit("before", s._step, s.programs.jit("never run", s._step))
+    early(x(5))
+    assert not early.early and early.cnt == 1  # the other program is not captured: an ordinary first call
+
+
+def test_a_first_call_that_made_something_is_not_kept_as_the_capture(tmp_path: Path) -> None:
+    from tinyllm.tg import Tensor, programs
+
+    tables: dict[int, Any] = {}
+
+    def scaled(x: Any) -> Any:
+        n = int(x.shape[1])
+        if n not in tables:  # made once per width: captured, it would be made again at every call
+            tables[n] = Tensor(np.arange(1, n + 1, dtype=np.float32)).contiguous().realize()
+        out = (x * tables[n]).contiguous()
+        out.realize()
+        return out
+
+    def x(n: int, value: float) -> Any:
+        return Tensor(np.full((1, n), value, dtype=np.float32)).contiguous().realize()
+
+    p = programs.Programs(None)
+    narrow = p.jit("narrow", scaled)
+    wide = p.jit("wide", scaled, narrow)
+    for value in (1.0, 2.0):
+        assert np.array_equal(narrow(x(4, value)).numpy(), value * np.arange(1, 5, dtype=np.float32)[None])
+    assert narrow.linears == 1
+    # the wide program's first call makes its table: two realizes where the narrow program's capture had one
+    assert np.array_equal(wide(x(8, 3.0)).numpy(), 3.0 * np.arange(1, 9, dtype=np.float32)[None])
+    assert wide.again and not wide.early and wide.cnt == 1 and wide.captured is None
+    assert np.array_equal(wide(x(8, 4.0)).numpy(), 4.0 * np.arange(1, 9, dtype=np.float32)[None])  # captures
+    assert wide.cnt == 2 and wide.linears == 1
+    assert np.array_equal(wide(x(8, 5.0)).numpy(), 5.0 * np.arange(1, 9, dtype=np.float32)[None])
+
+
 def test_a_process_loads_the_programs_another_built_and_computes_the_same(dev_model: Path) -> None:
     """The small model on the CPU through `tools/program_cache_check.py`: a second process finds the first one's
     programs, builds none, and its logits after two prompts and while decoding are the first one's bit for bit."""
@@ -144,6 +195,28 @@ def test_a_process_loads_the_programs_another_built_and_computes_the_same(dev_mo
     cmd += ["--chunk", "16", "--prompt", "40", "--new", "20", "--steps", "3"]
     env = {k: v for k, v in os.environ.items() if k not in ("TINYLLM_PROGRAM_CACHE", "JITBEAM")}
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, timeout=900, env=env)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-2000:]
+    assert "0 failure(s)" in proc.stdout and "FAIL" not in proc.stdout
+
+
+@pytest.mark.gpu
+def test_flash_next_program_captured_by_its_first_call_is_the_one_two_calls_build() -> None:
+    """Qwen3.8-Flash-Next `UD-IQ4_XS` with its MTP block (`tools/program_build_check.py`): the 768-token prefill
+    program captured by its first call, its tuned kernels lowered in worker processes, gives the logits and state
+    of the same program built in two calls, bit for bit."""
+    from tinyllm.server.serve import find_mtp
+    from tinyllm.weights.resolve import find_model
+
+    try:
+        path = find_model("Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf")
+    except FileNotFoundError as e:
+        pytest.skip(str(e))
+    if find_mtp(path) is None:
+        pytest.skip(f"no MTP block next to {path.name}")
+    env = {k: v for k, v in os.environ.items() if k not in ("TINYLLM_DEVICE", "DEV", "TINYLLM_PROGRAM_CACHE")}
+    env |= {"JITBEAM": "2", "TINYLLM_STATIC_SIZES": "768"}
+    cmd = [sys.executable, "tools/program_build_check.py", str(path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, timeout=2400, env=env)
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-2000:]
     assert "0 failure(s)" in proc.stdout and "FAIL" not in proc.stdout
 

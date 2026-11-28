@@ -65,12 +65,27 @@ ARCH_DRAFTS = {"qwen4exp": (4, 4)}
 # drafts of a block copied from earlier text, for models whose session verifies such blocks (0 elsewhere)
 ARCH_COPY = {"qwen4exp": 15}
 DEFAULT_CHUNK = 128
+# architectures served at the context they were trained for (the file's `<arch>.context_length`) unless --ctx says
+# otherwise. Qwen3.8-Flash-Next: 262,144; its sparse attention reads at most 2,051 positions a token whatever the
+# context, and the cache of the full context takes about 7 GiB more than 32,768 (docs/04-qwen3.8-flash-next.md)
+ARCH_NATIVE_CTX = {"qwen4exp"}
+DEFAULT_CTX = 32768
 
 
 def architecture(path: Path) -> str:
     from tinyllm.weights import gguf
 
     return str(gguf.read(path, header_only=True).kv.get("general.architecture", ""))
+
+
+def default_context(path: Path) -> int:
+    """Context tokens when --ctx is not given: the model's own for ARCH_NATIVE_CTX, else DEFAULT_CTX."""
+    from tinyllm.weights import gguf
+
+    kv = gguf.read(path, header_only=True).kv
+    arch = str(kv.get("general.architecture", ""))
+    native = kv.get(f"{arch}.context_length")
+    return int(native) if arch in ARCH_NATIVE_CTX and native else DEFAULT_CTX
 
 
 def main(args: argparse.Namespace) -> int:
@@ -111,7 +126,7 @@ def main(args: argparse.Namespace) -> int:
     copy = args.copy if args.copy is not None else ARCH_COPY.get(arch, 0)
     runner = UpstreamRunner(
         path,
-        args.ctx,
+        args.ctx or default_context(path),
         chunk=chunk,
         speculative=k,
         drafter=drafter if k else None,
@@ -145,6 +160,11 @@ def main(args: argparse.Namespace) -> int:
     runner.warmup()
     log.info("%s in %.1fs", "ready" if saved.restored else "compiled", runner.warmup_seconds)
     log.info("  %s", ", ".join(f"{name} {seconds:.0f}s" for name, seconds in runner.warmup_stages.items()))
+    if not saved.restored:
+        early = [name for name, jit in saved.jits.items() if jit.early]
+        again = [name for name, jit in saved.jits.items() if jit.again]
+        if early or again:
+            log.info("  %d programs captured by their first call%s", len(early), f"; twice: {again}" if again else "")
     if not saved.restored and saved.path is not None:
         if saved.note:
             log.warning("programs %s: the next start compiles them again", saved.note)
@@ -182,7 +202,12 @@ def add_parser(sub: Any) -> None:
     sp = sub.add_parser("serve", help="serve a model through an OpenAI-compatible HTTP API")
     sp.add_argument("model", help="GGUF path, or a file name under the model directory")
     sp.add_argument("--device", default=None, help="auto, amd, cpu or a tinygrad DEV string (default: auto)")
-    sp.add_argument("--ctx", type=int, default=32768, help="context tokens (default: %(default)s)")
+    sp.add_argument(
+        "--ctx",
+        type=int,
+        default=None,
+        help=f"context tokens (default: {DEFAULT_CTX}; the model's own, 262,144, for Qwen3.8-Flash-Next)",
+    )
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default: %(default)s)")
     sp.add_argument("--port", type=int, default=8000)
     sp.add_argument("--api-key", default=None, help="require this bearer token on /v1 routes")

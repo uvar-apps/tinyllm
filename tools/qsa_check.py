@@ -11,7 +11,9 @@ chunks across it:
 - each list must be exactly the top 512 of the kernel's own scores (ties lowest block first), ascending, then the
   tail block;
 - the attention must match float64 attention over the listed positions as closely as decoding's kernel matches
-  dense attention.
+  dense attention;
+- the grouped prefill kernel's unions of a group's lists, with the rows that listed each block, must equal numpy's,
+  for random lists anywhere in the context (`--context 262144` reaches the model's full context).
 With --time it times decode and a prefill call (--time-rows, 128) at N positions. Exits non-zero on a mismatch.
 """
 
@@ -169,6 +171,59 @@ def main() -> int:
         )
         return ok
 
+    def run_union(q_first: int, rows: int, pad: int, share: float) -> bool:
+        """The unions of random ascending lists (`qsa.union`) against numpy. A row takes 512 of its complete blocks,
+        `share` of them drawn once for its group, then its tail block; padding rows repeat the last row's list."""
+        sel_np = np.zeros((1, pad, TOPB + 1), dtype=np.int32)
+        lists: list[list[int]] = []
+        common: np.ndarray = np.zeros(0, dtype=np.int64)
+        for r in range(pad):
+            if r >= rows:
+                lists.append(lists[rows - 1])
+                sel_np[0, r] = sel_np[0, rows - 1]
+                continue
+            q_pos = q_first + r
+            n = (q_pos + 1) // KPOOL
+            if n <= TOPB:
+                blocks = list(range(n))
+            else:
+                if r % qsa.GROUP == 0:  # positions rise along a group: its first row's blocks suit every row
+                    common = rng.choice(n, int(TOPB * share), replace=False)
+                rest = np.setdiff1d(np.arange(n), common)
+                blocks = sorted([*common.tolist(), *rng.choice(rest, TOPB - len(common), replace=False).tolist()])
+            blocks += [n] if (q_pos + 1) % KPOOL else []
+            lists.append(blocks)
+            sel_np[0, r, : len(blocks)] = blocks
+        n_rows = rows if rows == pad else UOp.variable("union_rows", 1, pad).bind(rows)
+        got = qsa.union(Tensor(sel_np).realize(), v_pos.bind(q_first), n_rows, KPOOL, TOPB, N // KPOOL + 1)
+        Tensor.realize(*got)
+        ulist, umask, ulen = (t.numpy()[0] for t in got)
+        ok, sizes = True, []
+        for g in range(pad // qsa.GROUP):
+            members = lists[g * qsa.GROUP : (g + 1) * qsa.GROUP]
+            want = sorted(set().union(*members))
+            marks = [sum(1 << i for i, m in enumerate(members) if b in set(m)) for b in want]
+            m = int(ulen[g, 0])
+            sizes.append(len(want))
+            if m != len(want) or ulist[g, :m].tolist() != want or umask[g, :m].tolist() != marks:
+                print(f"  group {g}: {m} entries against {len(want)}, or different blocks or marks")
+                ok = False
+                break
+        print(
+            f"union of {rows} rows (of {pad}) from {q_first}, {share:.0%} shared: {min(sizes)} to {max(sizes)} "
+            f"entries: {'ok' if ok else 'FAIL'}"
+        )
+        return ok
+
+    for q_first, rows, pad, share in (
+        (0, 128, 128, 0.0),
+        (1990, 128, 128, 0.5),
+        (4000, 100, 128, 0.0),
+        (N - 2049, 2048, 2048, 0.0),
+        (N - 2049, 2048, 2048, 0.9),
+        (N - 1000, 999, 1024, 0.3),
+    ):
+        failed |= not run_union(q_first, rows, pad, share)
     failed |= not run_lists(N - 200, 128)
     for q_first in (0, 5, 2046, 2047, 2048, 2050, 2051, 2052, 3001, N - 2):
         failed |= not run(q_first, 1, False)

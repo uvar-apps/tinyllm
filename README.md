@@ -97,10 +97,11 @@ print(reply.choices[0].message.content)
   98,304 tokens, faster for English and code, poor for other languages). Requests that sample on the host decode
   one token at a time. `/metrics` counts drafts and accepted drafts.
 - Qwen3.8-Flash-Next (`UD-Q4_K_XL` and `UD-IQ4_XS`, pass the first of the four shards) serves with its chat template
-  and tool calls. Its sparse attention runs on tinyllm's kernels (`qsa`): each token reads at most 2,051 positions,
+  and tool calls, at its own 262,144-token context unless `--ctx` gives another (the full cache takes about 7 GiB
+  more than 32,768). Its sparse attention runs on tinyllm's kernels (`qsa`): each token reads at most 2,051 positions,
   so decode does not slow with the context. In an agent's conversation on `UD-Q4_K_XL` (32k context, 4k to 20k
   tokens) it decodes at 25–27 tok/s. It prefilled at 560–650 tok/s there before the grouped sparse attention and the
-  fused residual mix; 16,384 tokens of code now prefill at about 800 tok/s. Prefill runs in passes of 2,048 tokens, with
+  fused residual mix; 16,384 tokens of code now prefill at about 1,260 tok/s. Prefill runs in passes of 2,048 tokens, with
   expert layers grouped by expert (both files' expert types). The first start of the server spends about
   7 minutes tuning tinygrad's kernels (`--beam`), cached for later starts. Prompt reuse works as on the 27B (113 MiB per
   state checkpoint). Its 28.8 GB n-gram table stays in the file, and tinyllm reads the 16 rows each token needs in
@@ -118,11 +119,11 @@ print(reply.choices[0].message.content)
   change decodes at about 110 tok/s, against 62 with MTP drafts alone and 28 plain.
 
 - Start-up: the server keeps its compiled programs between starts, for every model. The first start with a model,
-  with other settings, or after a change to tinygrad or to tinyllm's `tg` sources compiles them (22 minutes for
+  with other settings, or after a change to tinygrad or to tinyllm's `tg` sources compiles them (about 15 minutes for
   Flash-Next, 2 to 3 for the 27B) and saves them; later starts load them and are ready about 65 s after launch on
   Flash-Next (40 s of it loading the model) and 24 to 29 s on the 27B, with outputs the same bit for bit
   (`tools/program_cache_check.py`). They live under `~/.cache/tinyllm/programs` (`--program-cache DIR` or
-  `TINYLLM_PROGRAM_CACHE`; `0` compiles at every start), 50 MB for Flash-Next, the four most recently used
+  `TINYLLM_PROGRAM_CACHE`; `0` compiles at every start), about 55 MB for Flash-Next, the four most recently used
   sessions kept. See docs/04-qwen3.8-flash-next.md, section 16.
 
 `tools/openai_sdk_check.py --base-url ...` runs the phase 1 checks against a running server; `tools/spec_check.py`
@@ -180,13 +181,20 @@ tinyllm adds its own GPU kernels where tinygrad has no fast path (`src/tinyllm/t
 | `q8` | Q8_0, prefill only | Q8_0 file prefill: 131 → 210 tok/s (with fixed-length chunks, below) |
 | `attention` | one-token attention and the speculative verify, gfx11 | DFlash2 cycle at 32k: 309 → 154 ms; at 128k: 404 → 283 ms |
 | `moe` | expert layers in Q5_0, Q5_1, Q2_0 | Qwen3.8-Flash-Next (not the 27B): one token's expert down projection 0.85 → 0.11 ms; `UD-Q4_K_XL` decode 6.9 → 26.6 tok/s with the rest of F1 |
-| `moe_mm` | expert layers in prefill (Q4_K, Q5_K, Q5_1, Q8_0), grouped by expert, gate and up fused | Flash-Next `UD-Q4_K_XL`: one 2,048-token Q4_K gate call 83.5 → 5.0 ms |
-| `hc` | Flash-Next's gated residual in prefill: stream norm and inject gates in one kernel | 2,048-token pass 2,674 → 2,520 ms |
+| `moe_mm` | expert layers in prefill (Q4_K, Q5_K, Q5_1, Q8_0), grouped by expert, gate and up fused; the choice of experts and the routing tables for large calls | Flash-Next `UD-Q4_K_XL`: one 2,048-token Q4_K gate call 83.5 → 5.0 ms; choosing 10 of 512 experts for 2,048 tokens 0.61 → 0.07 ms, the routing tables 0.62 → 0.06 |
+| `hc` | Flash-Next's gated residual in prefill: stream norm and inject gates in one kernel, which in large calls also takes the residual update of the sublayer before; the mix read from that kernel's fp16 tiles | 2,048-token pass 2,674 → 2,520 ms; later, 16,384 tokens of code 1,222–1,231 → 1,263 tok/s |
+| `delta` | the DeltaNet block in prefill (fixed-length calls of 32 rows or more): convolution, norms and output gate in three kernels, its scan with a state row on four lanes | 128-token calls, UD-Q4_K_XL: 355–359 → 372–373 tok/s; Q8_0: 364–365 → 373–374. Flash-Next 2,048-token pass: the block 295 → 155 ms; 16,384 tokens of code 1,010 → 1,089 tok/s |
 | `qsa` | Qwen3.8-Flash-Next's sparse attention above a 2,048 context, gfx11 | decode step at position 16,000: 196 → 40.5 ms; agent benchmark decode 5–12 → 25–27 tok/s |
 
 They are on by default. `TINYLLM_KERNELS=none` (or a subset, such as `dense`) selects tinygrad's own paths for
 comparison. `tools/dense_kernel_check.py`, `tools/q4_kernel_check.py`, `tools/prefill_kernel_check.py` and
-`tools/moe_kernel_check.py`, `tools/moe_mm_check.py` and `tools/qsa_check.py` check them on the GPU; `tools/profile_step.py --set` compares kernel settings inside the model.
+`tools/moe_kernel_check.py`, `tools/moe_mm_check.py`, `tools/moe_route_check.py`, `tools/qsa_check.py`,
+`tools/delta_scan_check.py`, `tools/deltanet_check.py` and `tools/tile_layout_check.py` check them on the GPU; `tools/profile_step.py --set` compares kernel settings inside the model.
+
+Large prefill calls of Q8_0 and Q6_K layers run on a tiled kernel (`gemm.py`). For layers with many inputs and few
+outputs, the kernels that produce the layer's activations write them tile by tile, as that kernel reads them:
+Flash-Next's dense Q8_0 layers take 427 ms of a 2,048-token pass instead of 553 (docs/04-qwen3.8-flash-next.md,
+section 14). Its F32 expert router runs there too.
 
 The matrix-core kernels share one loop (`wmma.py`). `dense_mm` and `q8` reserve local memory they do not use, which
 lowers the occupancy the compiler schedules for; it then issues each step's loads at once instead of in rounds, and

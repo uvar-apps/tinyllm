@@ -72,6 +72,18 @@ def test_serve_drafts_only_with_an_mtp_block(tmp_path: Path) -> None:
     assert not has_mtp(write_gguf(tmp_path / "plain.gguf", kv, []))
 
 
+def test_serve_defaults_flash_next_to_its_own_context(tmp_path: Path) -> None:
+    """Without --ctx, Qwen3.8-Flash-Next (qwen4exp) serves at the context its file states; other models at 32,768."""
+    from tinyllm.server.serve import DEFAULT_CTX, default_context
+
+    flash = {"general.architecture": "qwen4exp", "qwen4exp.context_length": 262144}
+    assert default_context(write_gguf(tmp_path / "flash.gguf", flash, [])) == 262144
+    assert default_context(write_gguf(tmp_path / "flash-bare.gguf", {"general.architecture": "qwen4exp"}, [])) == 32768
+    other = qwen35_kv()
+    other["qwen35.context_length"] = 262144
+    assert default_context(write_gguf(tmp_path / "other.gguf", other, [])) == DEFAULT_CTX == 32768
+
+
 def test_serve_finds_an_mtp_block_shipped_apart_from_the_model(tmp_path: Path) -> None:
     from tinyllm.server.serve import find_mtp
 

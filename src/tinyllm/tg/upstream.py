@@ -41,6 +41,7 @@ from tinyllm.tg import (
     synchronize,
 )
 from tinyllm.tg import kernels as tl_kernels
+from tinyllm.tg import lowering as tl_lowering
 from tinyllm.tg import mtp as tl_mtp
 from tinyllm.tg import ngram as tl_ngram
 from tinyllm.tg import programs as tl_programs
@@ -191,6 +192,7 @@ class UpstreamSession:
             (UpstreamSession, tl_ngram.FileRows, GGUFPackedTable),
         )
         jit = self.programs.jit
+        tl_lowering.install()  # a program's tuned kernels are lowered in worker processes
         # drafts of a block copied from earlier text (0: none): its verify runs copy + 1 rows on the matrix cores
         if copy and (copy + 1) % 16:
             raise ValueError(f"a copied block's verify needs a multiple of 16 rows, not {copy + 1}")
@@ -254,7 +256,9 @@ class UpstreamSession:
             else:
                 lengths = tuple(int(n) for n in setting.split(",") if n.strip() and 0 < int(n) < chunk)
         self.static_sizes = lengths
-        self._static: dict[int, Any] = {n: jit(f"prefill {n}", fixed) for n in lengths}
+        # the same function at other lengths: once the full chunk's program is captured, each of these is captured
+        # by its first call (tinyllm.tg.programs.Program), as are the later partial and restore programs below
+        self._static: dict[int, Any] = {n: jit(f"prefill {n}", fixed, self._static_jit) for n in lengths}
         if self._static_jit is not None:
             self._static[chunk] = self._static_jit
         # with large chunks, calls shorter than a chunk (the rest of a prompt) go to programs compiled for at most
@@ -268,14 +272,12 @@ class UpstreamSession:
         self.partial_sizes = sizes
         # the smallest: also the grid of the checkpoints taken before a prompt's last call (`prefill`)
         self.small_chunk = sizes[0] if sizes else 0
-        self._partial = [
-            (
-                n,
-                jit(f"prefill up to {n}", forward or self.model.forward),
-                UOp.variable("toks_small" if i == 0 else f"toks_{n}", 1, n),
-            )
-            for i, n in enumerate(sizes)
-        ]
+        self._partial: list[tuple[int, Any, Any]] = []
+        for i, n in enumerate(sizes):
+            program = jit(f"prefill up to {n}", forward or self.model.forward, self._partial[0][1] if i else None)
+            self._partial.append((n, program, UOp.variable("toks_small" if i == 0 else f"toks_{n}", 1, n)))
+        if logits and self._partial:  # the program for up to a whole chunk: that function too
+            self.model.prefill_jit.like = self._partial[0][1]
         self.load_seconds = time.perf_counter() - start
         self.max_context = int(self.model.max_context)
         self.vocab_size = int(self.model.config.vocab_size)
@@ -507,7 +509,10 @@ class UpstreamSession:
         # with an n-gram embedding the drafts come back to the host, which copies their rows of the table before
         # the verify reads them: two programs a cycle (`_draft_jit`, `_verify_jit`) instead of one (`_cycle_jit`)
         self._drafts_io = _mapped(k)
-        self._restore_jits = [jit(f"restore {n}", functools.partial(self._restore, n)) for n in range(most)]
+        self._restore_jits: list[Any] = []
+        for n in range(most):
+            first = self._restore_jits[0] if n else None
+            self._restore_jits.append(jit(f"restore {n}", functools.partial(self._restore, n), first))
         if self.copy:
             c = self.copy
             self._copy_io = (_mapped(1 + c + (c + 1) * PARAMS), _mapped((c + 1) * OUTPUT + 1))

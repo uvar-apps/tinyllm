@@ -40,7 +40,7 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, flash_attention, gated_delta_prefill
 from tinygrad.llm.model import GatedDeltaNetBlock, PLELayer, TransformerBlock, apply_rope
 
-from tinyllm.tg.kernels import attention, decode_mma
+from tinyllm.tg.kernels import attention, decode_mma, deltafuse
 from tinyllm.tg.kernels.deltanet import gated_delta_rows, gated_delta_step
 
 
@@ -81,6 +81,8 @@ class SpecDeltaNetBlock(GatedDeltaNetBlock):  # type: ignore[misc]
         symbolic chunk: beta 0 and decay 1. And the states are those after the last real row: the convolution's
         from the window at `real`, the recurrent one from the scan, which also leaves it at `mid` on its way."""
         real, mid = self.padding
+        if deltafuse.serves(self, x):  # the same, with tinyllm's kernels around the scan
+            return deltafuse.prefill(self, x, start_pos, real, mid)
         B, T, _ = x.shape
         ssm = self.config.ssm
         assert len(start_pos) == 1 and isinstance(T, int) and not ssm.kda and 0 <= mid < T, "padded: one fixed length"

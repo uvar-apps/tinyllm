@@ -10,6 +10,7 @@ shapes.
     uv run python tools/prefill_kernel_check.py --type bf16 --configs 2b,2h,4b   # bf16 or fp16 instruction
     uv run python tools/prefill_kernel_check.py --no-weights [--no-inputs]      # diagnostics, errors expected
     uv run python tools/prefill_kernel_check.py --type q5_k --set "q45k.SHARED=(64,2,2)"  # experimental loops
+    uv run python tools/prefill_kernel_check.py --rows 2048 --shapes "hc down=320x10240,delta out=2560x6144"
 
 Blocks are random and wrapped exactly as tinygrad's GGUF loader wraps a tensor read from a file. The NumPy
 reference reproduces each path's arithmetic: matrix-core rows (multiples of 16) use fp16 activations and the
@@ -175,6 +176,17 @@ def dense_blocks(half: bool) -> Callable[[np.random.Generator, int], np.ndarray]
     return make
 
 
+def f32_blocks(rng: np.random.Generator, n: int) -> np.ndarray:
+    """uint32 bit patterns of fp32 values between about 1e-5 and 0.5 in magnitude."""
+    sign = rng.integers(0, 2, n, dtype=np.uint32) << 31
+    return sign | (rng.integers(110, 126, n, dtype=np.uint32) << 23) | rng.integers(0, 1 << 23, n, dtype=np.uint32)
+
+
+def f32_weights(blocks: np.ndarray, rows: np.ndarray, inp: int, mode: Mode) -> np.ndarray:
+    w = blocks.reshape(-1, inp)[rows].view(np.float32).astype(np.float64)
+    return w if mode == "exact" else f16(w)  # every path rounds the weights to fp16, to nearest
+
+
 def f16_toward_zero(a: np.ndarray) -> np.ndarray:
     """fp16 rounding toward zero (v_cvt_pkrtz_f16_f32), as float64."""
     near = a.astype(np.float16)
@@ -229,6 +241,7 @@ FORMATS = {
     "q8_0": Format(8, "q8", "q8", 34 / 32, q8_blocks, q8_weights, lambda packed: "tinygrad"),
     "bf16": Format(30, "densemm", "dense", 2, dense_blocks(False), dense_weights(False), dense_mode(30), True),
     "f16": Format(1, "densemm", "dense", 2, dense_blocks(True), dense_weights(True), dense_mode(1), True),
+    "f32": Format(0, "densemm", "f32", 4, f32_blocks, f32_weights, lambda mode: "tinygrad", True),
 }
 
 
@@ -286,6 +299,7 @@ def main() -> int:
     ap.add_argument("--mode", choices=("bf16", "f16"), default=None, help="BF16: matrix instruction to use")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--only", default=None, help="only layers whose name contains this text")
+    ap.add_argument("--shapes", default=None, help="layers in place of the 27B's: NAME=OUTxIN, comma-separated")
     ap.add_argument("--rows", default="1,8,32,128")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--rounds", type=int, default=5, help="with --configs: timing rounds over all configurations")
@@ -337,7 +351,11 @@ def main() -> int:
     failed = False
     head = f"{'layer':16s} {'out x in':>12s} {'rows':>4s} {'path':>9s} {'ms':>8s} {'GB/s':>6s} {'TFLOPS':>6s}"
     print(f"{args.type} {'config':>8s}: {head} {'max rel err':>11s}")
-    for name, out_f, in_f in QUICK if args.quick else SHAPES:
+    shapes = QUICK if args.quick else SHAPES
+    if args.shapes:
+        named = [item.split("=") for item in args.shapes.split(",")]
+        shapes = [(name, *(int(n) for n in size.split("x"))) for name, size in named]
+    for name, out_f, in_f in shapes:
         if args.only and args.only not in name:
             continue
         blocks = fmt.blocks(rng, out_f * in_f)

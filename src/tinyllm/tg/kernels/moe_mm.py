@@ -6,11 +6,14 @@ the types it lacks) compute one output row per (token, expert) pair, as decoding
 weights for every row. A 128-token prefill chunk of Qwen3.8-Flash-Next `UD-Q4_K_XL` spent 574 of its 717 ms there
 (docs/04-qwen3.8-flash-next.md, section 14). Here these kernels replace them for prefill:
 
-  route    one workgroup, one thread per expert: each thread counts the pairs routed to its expert (16 pairs a
-           load), prefix sums over the experts give each expert its place, and the thread writes its pairs there
-           in order. Each expert's rows are cut into tiles of up to 128 rows (`WIDE_TILES`), into one table of
-           (expert, first row, rows). The fused gate/up and the down projection of a block share one routing
-           (`moe_forward`).
+  route    one thread per expert: each thread counts the pairs routed to its expert (16 pairs a load), prefix
+           sums over the experts give each expert its place, and the thread writes its pairs there in order.
+           Each expert's rows are cut into tiles of up to 128 rows (`WIDE_TILES`), into one table of (expert,
+           first row, rows). The fused gate/up and the down projection of a block share one routing
+           (`moe_forward`). Small calls run it in one workgroup. Large ones (`ROUTE_MIN_PAIRS`) run a workgroup
+           per chunk of 512 pairs, twice: a kernel that counts each chunk's pairs per expert, then this one,
+           where a chunk's threads place their own pairs after those of the chunks before: 0.06 ms instead of
+           0.62 at 2,048 tokens, the same tables.
   block    one workgroup per (tile, 64 outputs), each wave 16 outputs of one weight matrix for all the tile's rows
            (`_block_kernel`): each weight is decoded once per tile, half a fragment per lane, the other half from
            the partner lane; weights load a block of 256 inputs at a time, a block ahead; activations are staged
@@ -28,6 +31,10 @@ The loop count of a workgroup is read from memory, which the pinned tinygrad's c
 so the kernels carry their own (`Estimates`; they only feed statistics).
 
 Padding pairs of a symbolic chunk (expert -1) are not routed: their rows are left unwritten and sliced off.
+
+`moe_forward` also takes the router's side of a block for calls of a fixed number of rows: the router and the
+experts read one fp16 copy of the block's input (`_shares_input`), and the experts and their weights are chosen
+in one kernel (`tinyllm.tg.kernels.moe_select`).
 
 The dequantizers give the matrix cores 16 weights per lane in fp16, as tinygrad's matrix-core kernels for dense
 layers do (`_q5_linear_f16_wmma_kernel`, `_quant_linear_f16_wmma_kernel`), with the same arithmetic where tinygrad
@@ -70,7 +77,7 @@ from tinygrad.llm.kernels.amd_gguf import (
 from tinygrad.renderer import Estimates
 from tinygrad.uop.ops import AxisType, KernelInfo
 
-from tinyllm.tg.kernels import moe_small
+from tinyllm.tg.kernels import gemm, moe_select, moe_small
 from tinyllm.tg.kernels.moe_small import Q2_0, Q5_0, Q5_1
 from tinyllm.tg.kernels.wmma import (
     FP16_1024,
@@ -86,6 +93,9 @@ from tinyllm.tg.kernels.wmma import (
 # copied block's 16-row verify reads each expert once here: 158 -> 135 ms a cycle
 MIN_TOKENS = 16
 ROUTE_VECTOR = 16  # pairs the route kernel reads per load step
+# Calls of at least ROUTE_MIN_PAIRS pairs build the routing tables in chunks of ROUTE_CHUNK pairs, a workgroup
+# each: every expert's thread reads every pair twice, and one workgroup runs on one compute unit (0 = one workgroup)
+ROUTE_CHUNK, ROUTE_MIN_PAIRS = 512, 2048
 BIG, SMALL = 64, 16  # the largest tile (4 matrix tiles share each weight fragment) and the row granularity
 WIDE_TILES = True  # experts with more than SMALL_MAX rows run in tiles of up to WIDE rows (`_block_kernel`)
 WIDE = 128  # rows of a wide tile: 8 matrix tiles share each weight fragment
@@ -99,6 +109,7 @@ WIDE_DIAG = ""  # diagnostics, wrong results: "weights" (constant fragments), "i
 WAVES, OUTPUT_TILES = 2, 1  # waves per workgroup and 16-output tiles per wave (per matrix when fused)
 SHARED = False  # stage each step's gathered activations in local memory once per workgroup (wmma_linear)
 FUSE_GATE_UP = True  # gate and up projections in one kernel, SwiGLU in its stores (`moe_forward`)
+SHARE_INPUT = True  # one fp16 copy of the block's input for the router and the experts (`_shares_input`)
 PREFETCH = False  # weights loaded a step ahead into registers (wmma_linear(prefetch=...))
 GROUPS_PER_STEP = 4  # 128 inputs a step: the small tiles read more of each weight block at once (2: -1% wall clock)
 # storage words per 256 weights, and the word type the kernels index
@@ -126,35 +137,78 @@ def _ireg(value: int) -> UOp:
     return ret.after(ret[0].store(UOp.const(value, dtypes.int32)))
 
 
+def _routed(sel: UOp, vector: UOp, mine_id: UOp) -> list[UOp]:
+    """Whether each of the pairs vector * ROUTE_VECTOR .. is this thread's expert (padding pairs, -1, match none)."""
+    loads = [_amd_load(sel[vector * ROUTE_VECTOR + 4 * k], 4) for k in range(ROUTE_VECTOR // 4)]
+    return [v[i].eq(mine_id) for v in loads for i in range(4)]
+
+
+def _ones(mine: list[UOp]) -> UOp:
+    one, zero = UOp.const(1, dtypes.int32), UOp.const(0, dtypes.int32)
+    return sum((m.where(one, zero) for m in mine[1:]), mine[0].where(one, zero))
+
+
+@functools.cache
+def _route_count_kernel(parts: UOp, sel: UOp, *, experts: int, chunks: int) -> UOp:
+    """parts[chunk * experts + expert]: how many of the chunk's pairs go to the expert. A workgroup per chunk."""
+    (P,) = sel.shape
+    vectors = P // ROUTE_VECTOR // chunks
+    assert P % (ROUTE_VECTOR * chunks) == 0, "route() pads the pairs to whole chunks"
+    g, e = UOp.range(chunks, 0, AxisType.GLOBAL), UOp.range(experts, 1, AxisType.LOCAL)
+    cnt = _ireg(0)
+    p = UOp.range(vectors, 100)
+    mine = _routed(sel, g * vectors + p, e.cast(dtypes.int32))
+    cnt = cnt.after(cnt[0].store(cnt.after(p)[0].load() + _ones(mine)).end(p))
+    store = parts[g * experts + e].store(cnt[0].load())
+    return UOp.group(store).end(e, g).sink(arg=KernelInfo(name="moe_route_count", opts_to_apply=()))
+
+
 @functools.cache
 def _route_kernel(
-    rows: UOp, *outs: UOp, experts: int, most_full: int, big: int = BIG, small: int = 3, wide: bool = False
+    rows: UOp,
+    *outs: UOp,
+    experts: int,
+    most_full: int,
+    big: int = BIG,
+    small: int = 3,
+    wide: bool = False,
+    chunks: int = 1,
 ) -> UOp:
     """Pairs sorted by expert (`rows`), and a tile table per class. Class 0 holds tiles of `big` rows: an expert's
     whole groups of `big` rows, and with `wide` all the rows of an expert with more than `small` * 16, else a rest
     of more than `small` * 16 rows. The `small` other classes hold one tile of 48, 32 or 16 rows for the rest. `outs`
     holds (expert, first row, rows) of each class, then each class's total; `most_full` bounds one expert's class-0
-    tiles."""
-    *tables, sel = outs
+    tiles.
+
+    With `chunks` > 1 the last input is `_route_count_kernel`'s counts, and a workgroup per chunk places its own
+    pairs: an expert's rows start after those of the chunks before. The first workgroup writes the tables."""
+    if chunks > 1:
+        *tables, sel, parts = outs
+    else:
+        *tables, sel = outs
     classes = len(tables) // 4
     (P,) = sel.shape
     one, zero = UOp.const(1, dtypes.int32), UOp.const(0, dtypes.int32)
-    g, e = UOp.range(1, 0, AxisType.GLOBAL), UOp.range(experts, 1, AxisType.LOCAL)
+    g, e = UOp.range(chunks, 0, AxisType.GLOBAL), UOp.range(experts, 1, AxisType.LOCAL)
     mine_id = e.cast(dtypes.int32)
+    vectors = P // ROUTE_VECTOR // chunks  # of pairs, per workgroup
+    assert P % (ROUTE_VECTOR * chunks) == 0, "route() pads the pairs to whole vectors and chunks"
+    first_group = g.eq(0)
 
-    assert P % ROUTE_VECTOR == 0, "route() pads the pairs to whole vectors"
-
-    def routed(p: UOp) -> list[UOp]:  # whether each of the pairs p * ROUTE_VECTOR .. is this thread's expert
-        loads = [_amd_load(sel[p * ROUTE_VECTOR + 4 * k], 4) for k in range(ROUTE_VECTOR // 4)]
-        return [v[i].eq(mine_id) for v in loads for i in range(4)]  # padding pairs (-1) match no expert
-
-    def ones(mine: list[UOp]) -> UOp:
-        return sum((m.where(one, zero) for m in mine[1:]), mine[0].where(one, zero))
-
-    cnt = _ireg(0)
-    p = UOp.range(P // ROUTE_VECTOR, 100)
-    cnt = cnt.after(cnt[0].store(cnt.after(p)[0].load() + ones(routed(p))).end(p))
-    count = cnt[0].load()
+    if chunks > 1:  # the expert's pairs in all the chunks, and in the chunks before this one
+        total, earlier = _ireg(0), _ireg(0)
+        c = UOp.range(chunks, 103)
+        part = parts[c * experts + e].load()
+        summed = UOp.group(
+            total[0].store(total.after(c)[0].load() + part),
+            earlier[0].store(earlier.after(c)[0].load() + (c < g).where(part, zero)),
+        ).end(c)
+        count, before_chunk = total.after(summed)[0].load(), earlier.after(summed)[0].load()
+    else:
+        cnt = _ireg(0)
+        p = UOp.range(vectors, 100)
+        cnt = cnt.after(cnt[0].store(cnt.after(p)[0].load() + _ones(_routed(sel, p, mine_id))).end(p))
+        count, before_chunk = cnt[0].load(), zero
     full = count // big
     rest = count - full * big
     cls = (rest + (SMALL - 1)) // SMALL  # 16-row tiles the rest needs
@@ -179,19 +233,20 @@ def _route_kernel(
     first_row = firsts[0]
 
     written = _ireg(0)
-    p2 = UOp.range(P // ROUTE_VECTOR, 101)
+    p2 = UOp.range(vectors, 101)
     taken = written.after(p2)[0].load()
-    mine = routed(p2)
+    vector = g * vectors + p2
+    mine = _routed(sel, vector, mine_id)
     fills, before = [], taken
     for i, m in enumerate(mine):  # this thread's pairs keep their order
-        place = (first_row + before).cast(dtypes.weakint)
-        fills.append(rows[place.valid(m)].store((p2 * ROUTE_VECTOR + i).cast(dtypes.int32)))
+        place = (first_row + before_chunk + before).cast(dtypes.weakint)
+        fills.append(rows[place.valid(m)].store((vector * ROUTE_VECTOR + i).cast(dtypes.int32)))
         before = before + m.where(one, zero)
     fill = UOp.group(*fills, written[0].store(before)).end(p2)
     groups = [fill]
     j = UOp.range(most_full, 102)
     jj = j.cast(dtypes.int32)
-    slot = (firsts[1] + jj).cast(dtypes.weakint).valid(jj < tiles[0])
+    slot = (firsts[1] + jj).cast(dtypes.weakint).valid((jj < tiles[0]) & first_group)
     expert_t, start_t, count_t = tables[0], tables[1], tables[2]
     groups.append(
         UOp.group(
@@ -201,7 +256,7 @@ def _route_kernel(
         ).end(j)
     )
     for c in range(1, classes):  # the smaller rest tiles: at most one per expert
-        slot_c = firsts[1 + c].cast(dtypes.weakint).valid(tiles[c].eq(1))
+        slot_c = firsts[1 + c].cast(dtypes.weakint).valid(tiles[c].eq(1) & first_group)
         expert_t, start_t, count_t = tables[4 * c], tables[4 * c + 1], tables[4 * c + 2]
         groups.append(
             UOp.group(
@@ -210,7 +265,7 @@ def _route_kernel(
                 count_t[slot_c].store(rest),
             )
         )
-    last = UOp.const(0, dtypes.weakint).valid(e.eq(experts - 1))
+    last = UOp.const(0, dtypes.weakint).valid(e.eq(experts - 1) & first_group)
     groups.append(UOp.group(*(tables[4 * c + 3][last].store(buf[q, 1 + c, e].load()) for c in range(classes))))
     return UOp.group(*groups).end(e, g).sink(arg=KernelInfo(name="moe_route", opts_to_apply=()))
 
@@ -1075,8 +1130,9 @@ def route(sel: Tensor, experts: int, tokens: int) -> tuple[list[tuple[int, tuple
     """([(tile rows, (expert, first row, rows, total))] per class, rows) for the flat pair list `sel` (int32, -1
     for padding)."""
     (P,) = sel.shape
-    if P % ROUTE_VECTOR:  # padding pairs match no expert
-        sel = sel.pad(((0, -P % ROUTE_VECTOR),), value=-1).contiguous()
+    chunks = -(-P // ROUTE_CHUNK) if ROUTE_CHUNK and P >= ROUTE_MIN_PAIRS else 1
+    if P % (ROUTE_VECTOR * chunks):  # padding pairs match no expert
+        sel = sel.pad(((0, -P % (ROUTE_VECTOR * chunks)),), value=-1).contiguous()
     if WIDE_TILES:  # every expert with more than SMALL_MAX rows in wide tiles, the others in one small tile
         big, small = WIDE, SMALL_MAX // SMALL
         # whole wide tiles hold WIDE rows, and at most one other per expert with more than SMALL_MAX rows
@@ -1091,8 +1147,15 @@ def route(sel: Tensor, experts: int, tokens: int) -> tuple[list[tuple[int, tuple
     for n in slots:
         outs += [i32(n), i32(n), i32(n), i32(1)]
     most_full = max(1, -(-tokens // big))
-    fxn = functools.partial(_route_kernel, experts=experts, most_full=most_full, big=big, small=small, wide=WIDE_TILES)
-    rows, *tables = Tensor.custom_kernel(*outs, sel, fxn=fxn)[: len(outs)]
+    common = dict(experts=experts, most_full=most_full, big=big, small=small, wide=WIDE_TILES)
+    if chunks > 1:  # count per chunk of pairs, then a workgroup per chunk places its pairs
+        count = functools.partial(_route_count_kernel, experts=experts, chunks=chunks)
+        parts = Tensor.custom_kernel(i32(chunks * experts), sel, fxn=count)[0]
+        fxn = functools.partial(_route_kernel, chunks=chunks, **common)
+        rows, *tables = Tensor.custom_kernel(*outs, sel, parts, fxn=fxn)[: len(outs)]
+    else:
+        fxn = functools.partial(_route_kernel, **common)
+        rows, *tables = Tensor.custom_kernel(*outs, sel, fxn=fxn)[: len(outs)]
     return [(size, tuple(tables[4 * i : 4 * i + 4])) for i, size in enumerate(sizes)], rows
 
 
@@ -1106,9 +1169,12 @@ def routing_of(sel: Tensor, experts: int) -> Routing:
     return route(sel.cast(dtypes.int32).flatten().contiguous(), experts, int(sel.shape[0]) * int(sel.shape[1]))
 
 
-def grouped_gate_up(gate: Any, up: Any, sel: Tensor, x: Tensor, routing: Routing | None = None) -> Tensor:
+def grouped_gate_up(
+    gate: Any, up: Any, sel: Tensor, x: Tensor, routing: Routing | None = None, xh: Tensor | None = None
+) -> Tensor:
     """SwiGLU(gate(x), up(x)) of the selected experts in fp16: sel (B, T, k), x (B, T, 1, in) -> (B, T, k, out).
-    `routing` is `routing_of(sel, experts)` when the caller shares it with the down projection."""
+    `routing` is `routing_of(sel, experts)` when the caller shares it with the down projection, and `xh` is x in
+    fp16 as (B * T, in) when the caller has it (a fixed number of rows)."""
     if not isinstance(T := sel.shape[1], int):  # symbolic token count: run on the padded maximum
         padded = grouped_gate_up(gate, up, sel.pad_to(sel.max_shape, value=-1), x.pad_to(x.max_shape), routing)
         return padded[..., :T, :, :]
@@ -1118,7 +1184,8 @@ def grouped_gate_up(gate: Any, up: Any, sel: Tensor, x: Tensor, routing: Routing
     experts, out_features = int(gate.weight.shape[0]), int(gate.weight.shape[1])
     classes, rows = routing if routing is not None else routing_of(sel, experts)
     grid = (_iq_grid(x.device, ggml_type),) if ggml_type in GRID_TYPES else ()
-    xh = x.reshape(B * T, in_features).cast(dtypes.half).contiguous()
+    if xh is None:
+        xh = x.reshape(B * T, in_features).cast(dtypes.half).contiguous()
     out = Tensor.empty(B * T * k, out_features, dtype=dtypes.half, device=x.device)
     common = dict(out_features=out_features, in_features=in_features, ggml_type=ggml_type, x_share=k)
     for i, (tile, (expert, start, count, total)) in enumerate(classes):
@@ -1173,34 +1240,63 @@ def fused_serves(block: Any, x: Tensor) -> bool:
     return bool(same and int(gate.weight.shape[1]) % _output_block() == 0)
 
 
+def _shares_input(router: Any, x: Tensor) -> bool:
+    """Whether the router and the experts can read one fp16 copy of x: a fixed number of rows that the router's
+    kernel converts to fp16 itself, as the expert kernels do (an F32 router on the matrix cores). Otherwise each
+    converts its own, and a router on another kernel keeps the activations it had. The copy is (rows, dim) and
+    each reader takes it as it is: tinygrad copies a reshaped tensor again when asked for a contiguous one."""
+    from tinyllm.tg.kernels import densemm, hook
+
+    if not SHARE_INPUT or not all(isinstance(s, int) for s in x.shape):
+        return False
+    kernel = router.__dict__.get("_tinyllm_kernel", hook._UNSET)
+    if kernel is hook._UNSET:  # as the linear hook chooses on a layer's first call
+        kernel = router._tinyllm_kernel = hook._choose(router)
+    return bool(kernel == "f32" and densemm.serves(router, x))
+
+
 def moe_forward(block: Any, x: Tensor) -> Tensor:
     """The expert part of `FFNBlock._feed_forward` (tinygrad.llm.model, pinned commit) with gate and up fused."""
     cfg = block.config
-    h = x.unsqueeze(2)
-    logits = block.ffn_gate_inp(x)
+    h, flat = x.unsqueeze(2), None
+    if _shares_input(block.ffn_gate_inp, x):  # one fp16 copy of the input, (rows, dim), for every reader
+        flat = x.reshape(-1, int(x.shape[-1])).cast(dtypes.half).contiguous()
+        logits = block.ffn_gate_inp(flat).reshape(*x.shape[:-1], -1)
+    else:
+        logits = block.ffn_gate_inp(x)
     bias = block.exp_probs_b["bias"] if hasattr(block, "exp_probs_b") else None
     gating, normalize = cfg.expert_gating_func, cfg.norm_topk_prob
     if gating == llm_model.ExpertGating.SOFTMAX and bias is None and normalize:
         gating, normalize = llm_model.ExpertGating.SOFTMAX_WEIGHT, False
-    if gating == llm_model.ExpertGating.SOFTMAX_WEIGHT:
-        scores = logits
-    elif gating == llm_model.ExpertGating.SOFTMAX:
-        scores = logits.softmax(-1)
-    elif gating == llm_model.ExpertGating.SIGMOID:
-        scores = logits.sigmoid()
+    if gating == llm_model.ExpertGating.SOFTMAX_WEIGHT and bias is None and not normalize:
+        fused_select = moe_select.serves(logits, cfg.num_experts_per_tok)
     else:
-        scores = logits.softplus().sqrt()
-    route_scores = scores if bias is None else scores + bias
-    _, sel = llm_model.pairwise_topk(route_scores, cfg.num_experts_per_tok)
-    probs = scores.gather(-1, sel)
-    if gating == llm_model.ExpertGating.SOFTMAX_WEIGHT:
-        probs = probs.softmax(-1)
-    if normalize:
-        probs = probs / probs.sum(axis=-1, keepdim=True)
-    probs = probs * cfg.routed_scaling_factor
+        fused_select = False
+    if fused_select:  # the selection and the softmax over it in one kernel
+        sel, probs = moe_select.select(logits, cfg.num_experts_per_tok)
+        if not moe_select.WEIGHTS:
+            probs = logits.gather(-1, sel).softmax(-1)
+        probs = probs * cfg.routed_scaling_factor
+    else:
+        if gating == llm_model.ExpertGating.SOFTMAX_WEIGHT:
+            scores = logits
+        elif gating == llm_model.ExpertGating.SOFTMAX:
+            scores = logits.softmax(-1)
+        elif gating == llm_model.ExpertGating.SIGMOID:
+            scores = logits.sigmoid()
+        else:
+            scores = logits.softplus().sqrt()
+        route_scores = scores if bias is None else scores + bias
+        _, sel = llm_model.pairwise_topk(route_scores, cfg.num_experts_per_tok)
+        probs = scores.gather(-1, sel)
+        if gating == llm_model.ExpertGating.SOFTMAX_WEIGHT:
+            probs = probs.softmax(-1)
+        if normalize:
+            probs = probs / probs.sum(axis=-1, keepdim=True)
+        probs = probs * cfg.routed_scaling_factor
     gate, down = block.ffn_gate_exps, block.ffn_down_exps
     routing = routing_of(sel, int(gate.weight.shape[0]))  # gate/up and down group the same pairs
-    act = grouped_gate_up(gate, block.ffn_up_exps, sel, h, routing)
+    act = grouped_gate_up(gate, block.ffn_up_exps, sel, h, routing, flat)
     found = down.__dict__.get("_tinyllm_moe_mm")
     if found is not None and serves(down, sel):
         x_down = grouped_linear(down, found, sel, act, routing, half=HALF_DOWN)  # (B, T, k, D)
@@ -1208,8 +1304,14 @@ def moe_forward(block: Any, x: Tensor) -> Tensor:
         x_down = down(sel, act)
     out = (x_down * probs.unsqueeze(-1)).sum(axis=-2)
     if hasattr(block, "ffn_gate_shexp"):
-        shared = llm_model.gated_activation(block.ffn_gate_shexp(x), block.ffn_up_shexp(x), cfg).contiguous()
+        # the shared expert's gate and up read the same copy when the tiled kernel takes them (it reads fp16)
+        layers, xs = (block.ffn_gate_shexp, block.ffn_up_shexp), x
+        if flat is not None and all(gemm.tiled_type(m, int(flat.shape[0]), x.device) is not None for m in layers):
+            xs = flat
+        shared = llm_model.gated_activation(block.ffn_gate_shexp(xs), block.ffn_up_shexp(xs), cfg).contiguous()
         shexp = block.ffn_down_shexp(shared)
+        if xs is flat:
+            shexp = shexp.reshape(*x.shape[:-1], -1)
         if hasattr(block, "ffn_gate_inp_shexp"):
             shexp = shexp * (x * block.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp

@@ -280,11 +280,15 @@ def test_dense_mm_serves_multiples_of_16_rows_of_large_layers() -> None:
     assert densemm._config(32, 96, 30)[0] == 1  # 3 groups of 32 are not a whole number of 2-group steps
 
 
+ALL_KERNELS = ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention", "moe", "moe_mm", "qsa", "hc")
+ALL_KERNELS += ("delta",)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention", "moe", "moe_mm", "qsa", "hc")),
-        ("all", ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention", "moe", "moe_mm", "qsa", "hc")),
+        (None, ALL_KERNELS),
+        ("all", ALL_KERNELS),
         ("q8,attention", ("q8", "attention")),
         ("none", ()),
         ("0", ()),
@@ -328,6 +332,7 @@ def test_unknown_kernel_names_are_rejected() -> None:
         ["tools/prefill_kernel_check.py", "--type", "bf16", "--rows", "1,8,16,32,64"],
         ["tools/prefill_kernel_check.py", "--type", "bf16", "--rows", "16,128", "--configs", "1b,2h,8b,8h"],
         ["tools/prefill_kernel_check.py", "--type", "f16", "--rows", "1,8,16,32,64"],
+        ["tools/prefill_kernel_check.py", "--type", "f32", "--rows", "16,32,128,256"],
         [
             "tools/prefill_kernel_check.py",
             *("--type", "q5_k", "--rows", "64,128", "--configs", "1u,1p"),
@@ -352,6 +357,9 @@ def test_unknown_kernel_names_are_rejected() -> None:
         ["tools/moe_mm_check.py", "--skewed", "--types", "q4_k,q5_1,q8_0", "--tokens", "64,300"],
         ["tools/moe_mm_check.py", "--skewed", "--fused", "--types", "q5_1,q8_0", "--tokens", "64,300"],
         ["tools/moe_mm_check.py", "--quick", "--set", "WIDE_TILES=0"],
+        ["tools/delta_scan_check.py"],
+        ["tools/tile_layout_check.py"],
+        ["tools/moe_route_check.py"],
     ],
     ids=[
         "bf16",
@@ -371,6 +379,7 @@ def test_unknown_kernel_names_are_rejected() -> None:
         "bf16-prefill",
         "bf16-prefill-configs",
         "f16-prefill",
+        "f32-prefill",
         "q5_k-shared-prefetch",
         "gpu-sampler",
         "deltanet-rollback",
@@ -391,6 +400,9 @@ def test_unknown_kernel_names_are_rejected() -> None:
         "moe-mm-skewed",
         "moe-mm-skewed-fused",
         "moe-mm-per-wave",
+        "delta-scan",
+        "tile-layout",
+        "moe-route",
     ],
 )
 def test_kernel_on_the_gpu(check: list[str]) -> None:
@@ -446,6 +458,23 @@ def test_flash_next_verify_computes_rows_independently_and_rolls_back() -> None:
     if find_mtp(path) is None:
         pytest.skip(f"no MTP block next to {path.name}")
     cmd = [sys.executable, "tools/verify_rows_check.py", str(path), "--copy", "15"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, timeout=1800, env=_gpu_env())
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-2000:]
+    assert "0 failure(s)" in proc.stdout and "FAIL" not in proc.stdout
+
+
+@pytest.mark.gpu
+def test_flash_next_fused_deltanet_prefill_matches_tinygrad_s() -> None:
+    """Qwen3.8-Flash-Next `UD-IQ4_XS` (`tools/deltanet_check.py`): the DeltaNet block's prefill on tinyllm's kernels
+    (convolution, norms and output gate around a scan with a state row on 4 lanes) against tinygrad's own path, at
+    position 0 and later, and for a padded call with the state kept inside it."""
+    from tinyllm.weights.resolve import find_model
+
+    try:
+        path = find_model("Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf")
+    except FileNotFoundError as e:
+        pytest.skip(str(e))
+    cmd = [sys.executable, "tools/deltanet_check.py", str(path), "--tokens", "512", "--blocks", "2"]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, timeout=1800, env=_gpu_env())
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-2000:]
     assert "0 failure(s)" in proc.stdout and "FAIL" not in proc.stdout

@@ -12,8 +12,21 @@ does not divide the call), each wave a 64 x 64 tile held in 16 accumulators. Eac
 - after a barrier every wave reads 4 activation and 4 weight fragments per 16 inputs from local memory and issues
   16 matrix operations.
 Rows of a symbolic chunk past its valid rows skip their steps (`wmma.valid_rows`).
+
+Activations by tile (`blocked_shape`, `blocked_linear`). A step copies 32 inputs of each of the block's 256 rows.
+In a (rows, inputs) array those are 256 pieces of 64 bytes, one per row and a row apart: with many inputs and few
+outputs (the DeltaNet block's output projection, 6,144 -> 2,560; the gated residual's down projection, 10,240 ->
+320) few workgroups share each piece and the kernel waits for memory, 12 to 20 TFLOPS where layers with many
+outputs reach 32 (tools/prefill_kernel_check.py, with `DIAG = "hot"` 35). Laid out as (row blocks, input blocks,
+256 rows, 32 inputs) a step's activations are 16 contiguous KB and a workgroup's steps follow each other in
+memory: the same layers run at 31 to 46. The kernels that produce those activations write them in that layout
+(`deltafuse`, `hc`); making it with a copy costs more than it saves.
 `mix_linear` is the same loop for Qwen3.8-Flash-Next's gated residual up projection, with stores that form its
 mix (`tinyllm.tg.kernels.hc`).
+
+F32 layers (Flash-Next's expert router, 2,560 -> 512) run here too: a thread reads 16 fp32 weights and rounds
+them to fp16 as tinygrad's loader does. Unsplit (`UNSPLIT`): 0.36 ms at 2,048 rows against 0.78 on the per-wave
+loop (tools/prefill_kernel_check.py --type f32, the conversion of its fp32 input taken off).
 """
 
 from __future__ import annotations
@@ -29,6 +42,7 @@ from tinygrad.llm.kernels.amd import WMMA_ARG, _amd_load, _is_cdna, _is_rdna4, _
 from tinygrad.llm.kernels.amd_gguf import Q6_K, Q8_0, _half, _load_byte, _load_u32
 from tinygrad.uop.ops import AxisType, KernelInfo
 
+from tinyllm.tg.kernels.dense import GGML_F32
 from tinyllm.tg.kernels.wmma import FP16_1024, bind_rows, byte_pairs, center_scale, magic_pairs, splat_half, valid_rows
 
 BM, BN_WIDE, BN_NARROW = 256, 128, 64  # rows and outputs per workgroup (narrow: layers of 64 k outputs)
@@ -36,9 +50,25 @@ BM_SMALL = 128  # rows per workgroup for calls that BM does not divide
 WAVE_M, WAVE_N = 64, 64  # the wave tile
 PAD = 8  # halves of padding per local-memory row, against bank conflicts
 MIN_ROWS = 128  # smaller calls keep the per-wave loop
-MIN_WORKGROUPS = 320  # split-K until a call has this many workgroups (8 per compute unit)
+# Split-K until a call has this many workgroups. Calls of 256-row blocks: 2 per compute unit, which is how many
+# run at a time (local memory). On Qwen3.8-Flash-Next at 2,048 rows, 80 against 320: 1,166-1,173 against 1,147-1,149
+# tok/s, and the gated residual's down projection takes 0.46 ms in two splits, 0.54 unsplit, 0.58 in eight (the
+# sum of the splits included). Calls of 128-row blocks have half the waves per workgroup and keep 320, measured
+# on Qwen3.8-27B's 128-row calls.
+MIN_WORKGROUPS = 80
+MIN_WORKGROUPS_SMALL = 320
+# Types that never split. Flash-Next's F32 router (2,560 -> 512: 32 workgroups at 2,048 rows) in the model's
+# profile: in four splits the kernel takes 0.34 ms and the sum of the splits 0.20 (16 MB read); unsplit 0.68. By
+# the wall clock unsplit wins, 1,721-1,725 against 1,730-1,733 ms a call, and it sums as the per-wave loop does:
+# the same logits bit for bit.
+UNSPLIT: frozenset[int] = frozenset({GGML_F32})
 PIPELINE = False  # double-buffered tiles, the next step fetched into registers: 20 against 25 TFLOPS (Q8_0)
 Q8_OFFSET = 1024 + 128
+BLOCKED = True  # kernels that can write a layer's activations by tile do (`takes_blocked`)
+BLOCKED_K = 0  # experiments: layers with at least this many inputs get their activations copied into tiles first
+# diagnostics, wrong results: "inputs" (constant activations, no loads), "hot" (every step reads the call's first
+# 32 inputs, so the activations stay cached), "weights" (constant raw words, no weight loads)
+DIAG = ""
 
 
 def _q8_fetch(raw: UOp, row: UOp, block: UOp, half: UOp | int, blocks_per_row: int) -> list[UOp]:
@@ -77,14 +107,28 @@ def _q6k_convert(words: list[UOp]) -> list[UOp]:
     return [center_scale(pair, s2, 1024 + 32) for w in words[2:] for pair in magic_pairs(w)]
 
 
+def _f32_fetch(raw: UOp, row: UOp, block: UOp, half: UOp | int, blocks_per_row: int) -> list[UOp]:
+    """An F32 half block: 16 weights, one fp32 word each (`dense.find_f32`)."""
+    base = (row * blocks_per_row + block) * 32 + half * 16
+    loads = [_amd_load(raw[base + 4 * i], 4, stream=True) for i in range(4)]
+    return [vec[j] for vec in loads for j in range(4)]
+
+
+def _f32_convert(words: list[UOp]) -> list[UOp]:
+    """Rounded to fp16 as tinygrad's loader rounds an F32 tensor (to nearest), two to a word."""
+    bits = [w.bitcast(dtypes.float32).cast(dtypes.half).bitcast(dtypes.uint16).cast(dtypes.uint32) for w in words]
+    return [bits[2 * i] | (bits[2 * i + 1] << 16) for i in range(8)]
+
+
 # a dequantizer: fetch(raw, output row, 32-input block, half) -> raw words, kept in registers a step ahead;
 # convert(words) -> the 16 weights of that half block as 8 words of two fp16 each (low half first)
 Fetch = Callable[[UOp, UOp, UOp, Any], list[UOp]]
 DEQUANT: dict[int, Callable[[int], tuple[Fetch, Callable[[list[UOp]], list[UOp]]]]] = {
     Q8_0: lambda bpr: (lambda raw, row, block, half: _q8_fetch(raw, row, block, half, bpr), _q8_convert),
     Q6_K: lambda bpr: (lambda raw, row, block, half: _q6k_fetch(raw, row, block, half, bpr), _q6k_convert),
+    GGML_F32: lambda bpr: (lambda raw, row, block, half: _f32_fetch(raw, row, block, half, bpr), _f32_convert),
 }
-NAMES = {Q8_0: "q8_0", Q6_K: "q6_k"}
+NAMES = {Q8_0: "q8_0", Q6_K: "q6_k", GGML_F32: "f32"}
 
 
 @functools.cache
@@ -99,9 +143,13 @@ def _gemm_kernel(
     rows: Any,
     splits: int = 1,
     mix: int = 0,
+    blocked: bool = False,
+    mix_tiles: bool = False,
 ) -> UOp:
-    """With `mix` (the gated residual's stream count, `mix_linear`): extra = (xs, invs, weight), and each wave's
-    four 16-output tiles are the same 16 dimensions of the four streams, so the stores can form the mix."""
+    """With `blocked`, x is laid out by tile (`blocked_shape`): a step's activations are contiguous in memory.
+    With `mix` (the gated residual's stream count, `mix_linear`): extra = (xs, invs, weight), and each wave's
+    four 16-output tiles are the same 16 dimensions of the four streams, so the stores can form the mix. With
+    `mix_tiles` too, extra = (xn,): the normalised streams in fp16, laid out by tile."""
     M, N, K = int(out.shape[0]) // splits, out_features, in_features
     BM = _bm(M)
     BN = BN_WIDE if N % BN_WIDE == 0 else BN_NARROW
@@ -144,6 +192,11 @@ def _gemm_kernel(
 
     def fetch_a(r: int, at: UOp | int) -> UOp:
         row, c = a_place(r)
+        if DIAG == "inputs":
+            return UOp.stack(*(UOp.const(0.5, dtypes.half) for _ in range(8)))
+        at = 0 if DIAG == "hot" else at
+        if blocked:
+            return _amd_load(x[block_m, at, row, c], 8)
         return _amd_load(x[block_m * BM + row, at * 32 + c], 8)
 
     def weight_row(row: UOp) -> UOp:
@@ -155,6 +208,10 @@ def _gemm_kernel(
 
     def fetch_w(r: int, at: UOp | int) -> list[UOp]:
         row, h = b_place(r)
+        if DIAG == "weights" and ggml_type == GGML_F32:
+            return [UOp.const(0x3C800000, dtypes.uint32) for _ in range(16)]
+        if DIAG == "weights":
+            return [UOp.const(0x3C00 if w == 0 else 0x01020304, dtypes.uint32) for w in range(5)]
         return fetch_b(raw, weight_row(row), at, h)
 
     def write_a(target: UOp, buf: UOp | int, r: int, vec: Any) -> list[UOp]:
@@ -187,7 +244,7 @@ def _gemm_kernel(
             ]
         if mix:
             parts = (block_m, block_n, block_k, wave, lane, wm, wn, col, lane_group)
-            return _finish_mix(out, extra, accs, values, step, parts, M, N, mix, ggml_type)
+            return _finish_mix(out, extra, accs, values, step, parts, M, N, mix, ggml_type, mix_tiles)
         return _finish(
             out,
             accs,
@@ -276,10 +333,14 @@ def _finish_mix(
     N: int,
     mix: int,
     ggml_type: int,
+    tiles: bool = False,
 ) -> UOp:
     """Stores of the gated residual's mix: out[token, d] = mean over the streams s of sigmoid(acc_s) * xs[token, s, d]
-    * inv[token, s] * weight[s, d], as `GatedResidual` computes it from the up projection (`hc.py`)."""
-    xs, invs, weight = extra  # (M, mix * dim) float32, (M, mix) float32, (mix * dim,) float32
+    * inv[token, s] * weight[s, d], as `GatedResidual` computes it from the up projection (`hc.py`).
+
+    With `tiles`, the normalised streams come from the norm kernel's fp16 copy, laid out by tile for the down
+    projection (`blocked_shape`): a workgroup's 256 rows of 32 dimensions of a stream are one 16 KB tile, where the
+    fp32 streams are 256 pieces of 128 bytes, a row (41 KB) apart."""
     block_m, block_n, block_k, wave, lane, wm, wn, col, lane_group = parts
     BM, dim = _bm(M), N // mix
     TMw = len(accs)
@@ -288,14 +349,22 @@ def _finish_mix(
     d = block_n * (BN_WIDE // mix) + wn * 16 + col
     for i in range(TMw):
         for v in range(8):  # lane l holds rows 2v + l // 16 of column l % 16 of each 16 x 16 tile
-            token = block_m * BM + wm * WAVE_M + i * 16 + 2 * v + lane_group
+            row = wm * WAVE_M + i * 16 + 2 * v + lane_group
+            token = block_m * BM + row
             terms = []
             for s in range(mix):
-                normed = xs[token, s * dim + d].load() * invs[token, s].load() * weight[s * dim + d].load()
+                if tiles:  # (row blocks, 32-input blocks, rows, 32) fp16
+                    (xn,) = extra
+                    place = xn[block_m, s * (dim // 32) + block_n, row, wn * 16 + col]
+                    normed = place.load().cast(dtypes.float32)
+                else:  # (M, mix * dim) float32, (M, mix) float32, (mix * dim,) float32
+                    xs, invs, weight = extra
+                    normed = xs[token, s * dim + d].load() * invs[token, s].load() * weight[s * dim + d].load()
                 terms.append(accs[i][s].after(update)[v].load().sigmoid() * normed)
             stores.append(out[token, d].store(sum(terms[1:], terms[0]) / mix))
     sink = UOp.group(*stores).end(wave, lane).end(block_m, block_n, block_k)
-    return sink.sink(arg=KernelInfo(name=f"gemm_{NAMES[ggml_type]}_mix_{BM}x{BN_WIDE}", opts_to_apply=()))
+    name = f"gemm_{NAMES[ggml_type]}_mix{'_tiles' if tiles else ''}_{BM}x{BN_WIDE}"
+    return sink.sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 
 def _bm(rows: int) -> int:
@@ -352,13 +421,26 @@ def mix_serves(layer: Any, x: Tensor, ggml_type: int, count: int) -> bool:
     return count == WAVE_N // 16 and serves(layer, x, ggml_type) and int(layer.out_features) % BN_WIDE == 0
 
 
-def mix_linear(layer: Any, raw: Tensor, ggml_type: int, x: Tensor, xs: Tensor, invs: Tensor, weight: Tensor) -> Tensor:
+def mix_linear(
+    layer: Any,
+    raw: Tensor,
+    ggml_type: int,
+    x: Tensor,
+    xs: Tensor,
+    invs: Tensor,
+    weight: Tensor,
+    xn: Tensor | None = None,
+) -> Tensor:
     """The gated residual's mix for prefill rows (`mix_serves`): mean over the streams of sigmoid(layer(x)) * xs * invs
     * weight, with the up projection's outputs never stored. x (tokens, in) half, xs (tokens, count * dim) and invs
-    (tokens, count) float32, weight (count * dim,) float32 -> (tokens, dim) float32."""
+    (tokens, count) float32, weight (count * dim,) float32 -> (tokens, dim) float32. With `xn`, the normalised
+    streams in fp16 laid out by tile (`blocked_shape(tokens, count * dim)`), the kernel reads those instead of
+    xs, invs and weight: half the bytes, in whole tiles, and the streams' values rounded to fp16."""
     tokens, in_features, out_features = int(x.shape[0]), int(layer.in_features), int(layer.out_features)
     count = int(invs.shape[-1])
     rows = valid_rows()
+    tiles = xn is not None
+    assert xn is None or (rows is None and tuple(xn.shape) == blocked_shape(tokens, out_features)), "whole tiles"
     fxn = functools.partial(
         _gemm_kernel,
         out_features=out_features,
@@ -366,20 +448,76 @@ def mix_linear(layer: Any, raw: Tensor, ggml_type: int, x: Tensor, xs: Tensor, i
         ggml_type=ggml_type,
         rows=rows,
         mix=count,
+        mix_tiles=tiles,
     )
     out = Tensor.empty(tokens, out_features // count, dtype=dtypes.float32, device=x.device)
-    return Tensor.custom_kernel(out, raw, bind_rows(x, rows), xs, invs, weight, fxn=fxn)[0]
+    sources = (xn,) if xn is not None else (xs, invs, weight)
+    return Tensor.custom_kernel(out, raw, bind_rows(x, rows), *sources, fxn=fxn)[0]
+
+
+def blocked_shape(tokens: int, in_features: int) -> tuple[int, int, int, int]:
+    """The shape of a call's activations laid out by tile: (row blocks, 32-input blocks, rows of a block, 32).
+    Row t, input c of the (tokens, inputs) array is element [t // BM, c // 32, t % BM, c % 32]."""
+    bm = _bm(tokens)
+    return tokens // bm, in_features // 32, bm, 32
+
+
+def takes_blocked(layer: Any, tokens: Any, device: Any) -> int | None:
+    """The layer's ggml type if a call of `tokens` rows goes to this kernel and it can read the activations by tile
+    (`blocked_linear`): a fixed number of rows, a layer the linear hook routes here. None otherwise."""
+    return tiled_type(layer, tokens, device) if BLOCKED else None
+
+
+def tiled_type(layer: Any, tokens: Any, device: Any) -> int | None:
+    """The layer's ggml type if the linear hook sends a call of `tokens` rows to this kernel (a fixed number of
+    rows of a Q8_0 or Q6_K layer), which then reads the activations in fp16. None otherwise."""
+    from tinyllm.tg.kernels import hook, q6k, q8
+
+    if not isinstance(tokens, int) or not isinstance(device, str):
+        return None
+    kernel = layer.__dict__.get("_tinyllm_kernel", hook._UNSET)
+    if kernel is hook._UNSET:  # as the linear hook chooses on a layer's first call (it adopts the packed weights)
+        kernel = layer._tinyllm_kernel = hook._choose(layer)
+    if not ((kernel == "q8" and q8.GEMM) or (kernel == "q6k" and q6k.GEMM)):
+        return None
+    ggml_type = int(layer.ggml_type)
+    probe = Tensor.empty(tokens, int(layer.in_features), dtype=dtypes.half, device=device)
+    return ggml_type if tokens % 16 == 0 and serves(layer, probe, ggml_type) else None
+
+
+def blocked_linear(layer: Any, ggml_type: int, xb: Tensor, tokens: int) -> Tensor:
+    """`layer(x)` for `tokens` rows whose fp16 activations `xb` are laid out by tile (`takes_blocked`,
+    `blocked_shape`): (tokens, out) float32."""
+    assert xb.dtype == dtypes.half and tuple(xb.shape) == blocked_shape(tokens, int(layer.in_features))
+    return _run(layer, layer.weight, ggml_type, xb, tokens, None, True)
 
 
 def gemm_linear(layer: Any, raw: Tensor, ggml_type: int, x: Tensor) -> Tensor:
     """`layer(x)` for prefill rows (`serves` is true): (..., in) -> (..., out) float32."""
-    tokens, in_features, out_features = int(prod(x.shape[:-1])), int(layer.in_features), int(layer.out_features)
+    tokens, in_features = int(prod(x.shape[:-1])), int(layer.in_features)
     rows = valid_rows()
+    half = x.cast(dtypes.float16)
+    if BLOCKED_K and in_features >= BLOCKED_K and rows is None:  # experiments: a generic copy, slower than it saves
+        bm = _bm(tokens)
+        xb = half.reshape(tokens // bm, bm, in_features // 32, 32).permute(0, 2, 1, 3).contiguous()
+        result = _run(layer, raw, ggml_type, xb, tokens, None, True)
+    else:
+        xs = bind_rows(half.contiguous().reshape(tokens, in_features), rows)
+        result = _run(layer, raw, ggml_type, xs, tokens, rows, False)
+    return result.reshape(*x.shape[:-1], int(layer.out_features))
+
+
+def _run(layer: Any, raw: Tensor, ggml_type: int, xs: Tensor, tokens: int, rows: Any, blocked: bool) -> Tensor:
+    """The kernel on `xs`, (tokens, in) fp16 or laid out by tile: (tokens, out) float32, the layer's bias added."""
+    in_features, out_features = int(layer.in_features), int(layer.out_features)
     # split-K for layers with few output blocks (the gated residual's down projection, 10,240 -> 320): enough
     # workgroups to fill the machine
     BN = BN_WIDE if out_features % BN_WIDE == 0 else BN_NARROW
     splits, blocks, n_steps = 1, (tokens // _bm(tokens)) * (out_features // BN), in_features // 32
-    while not PIPELINE and blocks * splits < MIN_WORKGROUPS and n_steps % (2 * splits) == 0 and n_steps // splits >= 16:
+    wanted = MIN_WORKGROUPS if _bm(tokens) == BM else MIN_WORKGROUPS_SMALL
+    if ggml_type in UNSPLIT:
+        wanted = 1
+    while not PIPELINE and blocks * splits < wanted and n_steps % (2 * splits) == 0 and n_steps // splits >= 16:
         splits *= 2
     fxn = functools.partial(
         _gemm_kernel,
@@ -388,11 +526,10 @@ def gemm_linear(layer: Any, raw: Tensor, ggml_type: int, x: Tensor) -> Tensor:
         ggml_type=ggml_type,
         rows=rows,
         splits=splits,
+        blocked=blocked,
     )
-    out = Tensor.empty(splits * tokens, out_features, dtype=dtypes.float32, device=x.device)
-    xs = bind_rows(x.cast(dtypes.float16).contiguous().reshape(tokens, in_features), rows)
+    out = Tensor.empty(splits * tokens, out_features, dtype=dtypes.float32, device=xs.device)
     result = Tensor.custom_kernel(out, raw, xs, fxn=fxn)[0]
     if splits > 1:
         result = result.reshape(splits, tokens, out_features).sum(0)
-    result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias

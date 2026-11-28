@@ -12,6 +12,7 @@
   moe_mm    expert layers in prefill, grouped by expert on the matrix cores (moe_mm.py)
   qsa       Qwen3.8-Flash-Next's sparse attention: block keys, exact top-k selection, paged attention (qsa.py)
   hc        Qwen3.8-Flash-Next's gated residual in prefill: stream norm and inject gates in one kernel (hc.py)
+  delta     the DeltaNet block in prefill: convolution, norms and output gate around its scan (deltafuse.py)
 
 They follow the structure of tinygrad's kernels in `tinygrad/llm/kernels` and reuse its helpers,
 so they are tied to the pinned tinygrad commit like everything else under `tinyllm.tg`.

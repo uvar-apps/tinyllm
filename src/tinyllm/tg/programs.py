@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from tinygrad import Tensor, TinyJit
+from tinygrad import Tensor
 from tinygrad.device import Buffer, BufferSpec
 from tinygrad.engine import realize as tg_realize
 from tinygrad.engine.jit import CapturedJit, _TinyJit
@@ -336,6 +336,47 @@ def _private(path: Path) -> bool:
     return info.st_uid == os.getuid() and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
 
 
+class Program(_TinyJit):  # type: ignore[misc]
+    """A `TinyJit` that a session may capture on its first call.
+
+    tinygrad runs a program's Python twice before it replays it: the first call runs the graph as it is, the
+    second captures it. The first is there for what a function does once: weights it realizes, caches it makes.
+    Captured, those would run at every call. A program whose function another program has already been through
+    (`like`: the same function at another length) has nothing left to do once, so its first call can capture, and
+    the first call's half of the build is saved (57 of 116 s for a prefill program of Qwen3.8-Flash-Next).
+
+    The check: a capture records one linear per realize. If this program's first call recorded another number
+    than `like`'s capture did, it did something on the way after all; that is done now, and the next call
+    captures again, as it would have after an ordinary first call."""
+
+    cnt: int  # tinygrad's: calls so far (0: run as it is, 1: capture, then replay)
+    captured: Any
+    like: Program | None = None
+    linears = 0  # realizes the capture recorded
+    early = False  # captured by its first call
+    again = False  # captured by its first call, then once more: the first call had made something
+
+    def add_linear(self, linear: UOp, var_vals: dict[str, int]) -> None:
+        self.linears += 1
+        super().add_linear(linear, var_vals)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        like = self.like
+        early = self.cnt == 0 and like is not None and like.captured is not None and like.linears > 0
+        if early:
+            self.cnt = 1
+        if self.cnt == 1:
+            self.linears = 0
+        out = super().__call__(*args, **kwargs)
+        if early:
+            assert like is not None
+            self.early = self.linears == like.linears
+            if not self.early:
+                self.captured = None
+                self.cnt, self.again = 1, True
+        return out
+
+
 class Programs:
     """The programs of one session: made by `jit`, put back by `restore` when a file for `key` exists, written by
     `save`. `directory` None: programs are built at every start, as without this class."""
@@ -354,11 +395,13 @@ class Programs:
         if directory is not None:
             _install_recorder()
 
-    def jit(self, name: str, fn: Any) -> Any:
-        """A `TinyJit` of `fn`, saved and restored under `name`."""
+    def jit(self, name: str, fn: Any, like: Any = None) -> Any:
+        """A program of `fn`, saved and restored under `name`. `like`: a program of the same function (at another
+        length, say); once that one is captured, this one is captured by its first call (`Program`)."""
         if name in self.jits:
             raise ValueError(f"two programs named {name}")
-        self.jits[name] = jit = TinyJit(fn)
+        self.jits[name] = jit = Program(fn)
+        jit.like = like
         return jit
 
     @property

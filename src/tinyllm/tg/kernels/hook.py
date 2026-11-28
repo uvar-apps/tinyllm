@@ -8,7 +8,9 @@ With "attention" enabled it also wraps the model's `flash_attention`, so one-tok
 as Q5_0, Q5_1 or Q2_0 (which tinygrad's MoE kernels do not cover) run on `tinyllm.tg.kernels.moe_small`. With
 "qsa", Qwen3.8-Flash-Next's sparse attention layers run on `tinyllm.tg.kernels.qsa`; with "moe_mm", expert layers
 in prefill run grouped by expert on the matrix cores (`tinyllm.tg.kernels.moe_mm`); with "hc", Flash-Next's gated
-residual normalises its streams and computes its gates in one kernel in prefill (`tinyllm.tg.kernels.hc`).
+residual normalises its streams and computes its gates in one kernel in prefill (`tinyllm.tg.kernels.hc`); with
+"delta", the DeltaNet blocks' prefill calls run what surrounds their scan in three kernels
+(`tinyllm.tg.kernels.deltafuse`).
 """
 
 from __future__ import annotations
@@ -22,10 +24,26 @@ from tinygrad.helpers import prod
 from tinygrad.llm import model as llm_model
 from tinygrad.llm.kernels import amd
 
-from tinyllm.tg.kernels import decode_mma, dense, densemm, hc, iq4xs, moe_mm, moe_small, q4, q6k, q8, q45k, qsa, wmma
+from tinyllm.tg.kernels import (
+    decode_mma,
+    deltafuse,
+    dense,
+    densemm,
+    gemm,
+    hc,
+    iq4xs,
+    moe_mm,
+    moe_small,
+    q4,
+    q6k,
+    q8,
+    q45k,
+    qsa,
+    wmma,
+)
 
 ENV = "TINYLLM_KERNELS"  # "all" (default), "none", or a comma-separated subset of KERNELS
-KERNELS = ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention", "moe", "moe_mm", "qsa", "hc")
+KERNELS = ("dense", "dense_mm", "q4", "q45k", "iq4xs", "q6k", "q8", "attention", "moe", "moe_mm", "qsa", "hc", "delta")
 Run = Callable[[Any, Tensor, Callable[[Any, Tensor], Tensor]], Tensor]  # (layer, x, tinygrad's own call)
 # prefill-only kernels: they take over tinygrad's packed weights and hand the rows they do not serve back to it
 _PREFILL: dict[str, tuple[Callable[[Any], Any], Run]] = {
@@ -44,11 +62,17 @@ def _dense(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]) -> 
     return dense.dense_linear(layer, x) if "dense" in _enabled else fallback(layer, x)
 
 
+def _f32(layer: Any, x: Tensor, fallback: Callable[[Any, Tensor], Tensor]) -> Tensor:
+    """F32 layers with many outputs (Flash-Next's expert router): large prefill calls on the tiled kernel, smaller
+    ones on the per-wave loop; the rest (decoding) keeps tinygrad's kernel."""
+    if densemm.GEMM and gemm.serves(layer, x, dense.GGML_F32):
+        return gemm.gemm_linear(layer, layer._tinyllm_dense[1], dense.GGML_F32, x)
+    return densemm.dense_mm_linear(layer, x) if densemm.serves(layer, x) else fallback(layer, x)
+
+
 _RUN: dict[str, Run] = {
     "dense": _dense,
-    "f32": lambda layer, x, fallback: (
-        densemm.dense_mm_linear(layer, x) if densemm.serves(layer, x) else fallback(layer, x)
-    ),
+    "f32": _f32,
     "q4": lambda layer, x, fallback: q4.q4_linear(layer, x),
     **{name: run for name, (_, run) in _PREFILL.items()},
 }
@@ -153,6 +177,8 @@ def install(names: Iterable[str] = KERNELS) -> None:
         moe_mm.install()
     if "hc" in names:
         hc.install()
+    if "delta" in names:
+        deltafuse.install()
     _install_experts()
     original = amd.Linear.__call__
     if getattr(original, "_tinyllm_hook", False):

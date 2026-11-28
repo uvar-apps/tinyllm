@@ -291,18 +291,10 @@ class UpstreamRunner:
             for _ in range(3):
                 self.feed_speculative(0, rows, *copy)
 
-        for again in range(2):
-            if again and not programs.pending():  # every program was loaded: none waits for its capturing call
-                break
+        def first() -> None:
+            """The programs that are the first of their function."""
             self.begin([0])
             stage(f"prefill {self.chunk} and the smallest partial", self.feed, [0] * (self.chunk + 3))
-            sizes = self.session.partial_sizes  # one token more than each takes runs the next program up
-            for size, above in zip(sizes, [*sizes[1:], self.chunk], strict=False):  # none: nothing to run
-                if len(self.tokens) + size + 8 + self.speculative_rows < self.max_context:
-                    stage(f"prefill up to {above}", self.feed, [0] * (size + 1))
-            for size in self.session.static_sizes:  # the fixed-length programs of calls on the checkpoint grid
-                if len(self.tokens) + size + 8 + self.speculative_rows < self.max_context:
-                    stage(f"prefill {size}", self.feed, [0] * size)
             stage("decode", lambda: (self.feed([0]), self.feed([0])))
             if self.device_sampling:
                 stage("decode", lambda: (self.feed_sampled(0, sampler), self.feed_sampled(0, sampler)))
@@ -313,7 +305,26 @@ class UpstreamRunner:
                 for n in range(self.speculative_rows - 1):
                     self.session._restore_row = n
                     stage("restores", self.session._settle)
-        self.warmup_stages = spent
+
+        def others() -> None:
+            """The prefill programs of the other lengths. Their function has been through a program by now, so one
+            call captures each (tinyllm.tg.programs.Program); run in `first`'s pass they would each be built in two."""
+            self.begin([0])
+            sizes = self.session.partial_sizes  # one token more than each takes runs the next program up
+            for size, above in zip(sizes, [*sizes[1:], self.chunk], strict=False):  # none: nothing to run
+                if len(self.tokens) + size + 8 + self.speculative_rows < self.max_context:
+                    stage(f"prefill up to {above}", self.feed, [0] * (size + 1))
+            for size in self.session.static_sizes:  # the fixed-length programs of calls on the checkpoint grid
+                if len(self.tokens) + size + 8 + self.speculative_rows < self.max_context:
+                    stage(f"prefill {size}", self.feed, [0] * size)
+
+        def until_captured(group: Any) -> None:
+            for again in range(2):  # a second pass captures what the first only ran; none when all were loaded
+                if again and not programs.pending():
+                    break
+                group()
+
+        until_captured(first)
         if self.checkpoints.slots:  # the second call captures each program, the third replays it with another slot
             other = min(1, self.checkpoints.slots - 1)
             for slot in (0, other, 0):
@@ -323,6 +334,9 @@ class UpstreamRunner:
             if self.session.pads:  # the copy of the state a padded prefill call keeps
                 for slot in (0, other, 0):
                     self.session.save_mid_state(slot)
+        if self.session.partial_sizes or self.session.static_sizes:
+            until_captured(others)
+        self.warmup_stages = spent
         self.forget()
         self.session.trace.clear()
         programs.save()

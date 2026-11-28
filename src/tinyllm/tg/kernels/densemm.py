@@ -13,7 +13,8 @@ Two ways to feed BF16 weights to the matrix cores (`MODE`):
   f16   the fp16 instruction, as for the quantized types: each word is converted to two fp16 weights
         (v_cvt_pkrtz_f16_f32), exactly for every weight of magnitude 2^-14 to 65504.
 F16 weights always take the fp16 instruction unchanged. F32 weights (tinygrad's loader rounds them to fp16) are
-read as fp32 words and rounded to fp16 the same way, for the layers with many outputs (Flash-Next's router).
+read as fp32 words and rounded to fp16 the same way, for the layers with many outputs (Flash-Next's router); their
+calls of whole 128-row blocks go to the tiled kernel (`GEMM`, gemm.py).
 
 The kernel reserves 64 KB of local memory per workgroup that it does not need (`RESERVE_LDS`), which limits a
 workgroup processor to two of its workgroups at a time, one wave per SIMD. That helps in two ways (`_config`):
@@ -51,6 +52,7 @@ NO_WEIGHTS = False  # diagnostic: constant weights, no weight loads. Wrong resul
 TILES: tuple[int, int] | None = None  # experiments: (token tile, output tiles per wave)
 LDS_BYTES: int | None = None  # experiments: local memory reserved per workgroup instead of RESERVE_LDS
 RESERVE_LDS = 65536  # the most a workgroup may use; see the module docstring and `_config`
+GEMM = True  # F32 layers: calls of whole 128-row blocks go to the tiled kernel (gemm.py)
 _BF16_TO_F16 = (
     "({{ unsigned int tl_w = (unsigned int)({0}); __builtin_bit_cast(unsigned int, __builtin_amdgcn_cvt_pkrtz("
     "__builtin_bit_cast(float, tl_w << 16), __builtin_bit_cast(float, tl_w & 0xFFFF0000u))); }})"

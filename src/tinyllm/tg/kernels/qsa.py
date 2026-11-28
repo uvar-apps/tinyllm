@@ -29,8 +29,9 @@ Radiance's design (section 6), four kernels do it:
               each row gathers its own keys. Positions past the query (in its tail block) and entries past its list
               are masked, and their values are zeroed when loaded. A second kernel combines the splits.
   grouped     for prefill calls of GROUP_MIN_ROWS rows or more: consecutive rows' lists overlap, so groups of
-              GROUP rows share their keys. One kernel merges a group's lists into their union with, per entry,
-              which rows listed it (a mark per block in local memory, then a prefix-sum compaction); another runs
+              GROUP rows share their keys. One kernel merges a group's sorted lists into their union with, per
+              entry, which rows listed it (binary searches and prefix sums in local memory set by the lists'
+              length, not by the context); another runs
               the group's GROUP x 12 queries (12 query heads per KV head, three matrix tiles, no padding) over the
               union's tiles, each gathered once, with a key counting for a query when its row listed the block.
               On 16,384 tokens of code (`UD-Q4_K_XL`, 2,048-token calls) prefill went from 773 to 797 tok/s. A
@@ -77,6 +78,8 @@ from tinygrad.llm.kernels.amd import (
 from tinygrad.renderer import Estimates
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
+from tinyllm.tg.kernels import gemm
+
 THREADS = 256  # threads of a scoring or selection workgroup
 SLOTS = WMMA_M  # a row's query heads of one KV head, padded to a matrix tile
 WAVES_N = 4  # waves per attention workgroup: they share out the output dimensions
@@ -86,7 +89,6 @@ SPLITS_LARGE, LARGE_ROWS = 1, 512  # from this many rows one workgroup takes all
 GROUPED = True  # prefill rows in groups sharing their keys (`_union`, `_attend_group`); off: one row a workgroup
 GROUP, WAVES_D = 4, 2  # rows of a group; waves sharing out the output dimensions of the group attention
 GROUP_MIN_ROWS = 64  # fewer rows (decode, the speculative verify) keep the one-row kernel
-MARKS_BYTES = 60 * 1024  # the union's local memory: one int32 per block of the cache
 GRID = {"head": 0, "split": 1, "row": 2}  # range ids of the attention kernel's grid axes
 NO_SCORE = 0x7F800001  # the bits after +inf: no score is at least this
 WAYS = 16  # intervals each pass of the threshold search splits its interval into
@@ -268,66 +270,102 @@ def _select(sel: UOp, scores: UOp, q_first: Any, rows: Any, kpool: int, topb: in
 
 
 @functools.cache
-def _union(
-    ulist: UOp, umask: UOp, ulen: UOp, sel: UOp, q_first: Any, rows: Any, kpool: int, topb: int, nblk: int
-) -> UOp:
+def _union(ulist: UOp, umask: UOp, ulen: UOp, sel: UOp, q_first: Any, rows: Any, kpool: int, topb: int) -> UOp:
     """For each group of GROUP consecutive rows: the union of their lists, ascending (`ulist`, `ulen` entries), and
     for each entry the rows that listed it (`umask`, bit i for row i of the group). Padding rows repeat the last
-    valid row's list (`_select`), so they list what it lists. `nblk` bounds the blocks a list can name."""
+    valid row's list (`_select`), so they list what it lists.
+
+    A list is ascending and names each block once, so the union is a merge of GROUP sorted lists of at most
+    topb + 1 entries, and its local memory is set by them (32 KiB), whatever the context or the position.
+    A block belongs to the first list that holds it. An entry's place in the union is the number of distinct
+    blocks below it: over the lists, the blocks each one owns below the entry's block (a binary search for where
+    the block falls in that list, then a prefix sum of the entries it owns). Its mark has bit j where list j holds
+    the block.
+
+    No store is gated: tinygrad simplifies a gated store's address and value under the gate, and here both hold the
+    prefix sums, so it would copy the whole scan once per gate. Every list holding a block finds the same place and
+    mark for it and writes them. Positions past a list's end hold `past`, above any block: their place is the
+    union's length, which they write to `ulen[..., 0]` and, with a meaningless mark, to the spare entry after the
+    union (`ulist` has one more entry than a union can fill). Real entries write `ulen[..., 1]`, which nothing
+    reads."""
     q_first, rows = _unbind(q_first), _unbind(rows)
-    B, R, _ = sel.shape
+    B, R, L = sel.shape  # L = topb + 1
     bb, grp = UOp.range(B, 0, AxisType.GLOBAL), UOp.range(R // GROUP, 1, AxisType.GLOBAL)
     tid = UOp.range(THREADS, 2, AxisType.LOCAL)
-    one, zero = _int(1), _int(0)
-    last_pos = q_first + (grp * GROUP + GROUP - 1).minimum(rows - 1)
-    nb = (last_pos + 1 + kpool - 1) // kpool  # blocks the group's lists can name: 0 .. nb - 1
-    marks = UOp.alloc((nblk,), dtypes.int32, addrspace=AddrSpace.LOCAL)
-    zj = UOp.range((nb + THREADS - 1) // THREADS, 100)
-    zi = zj * THREADS + tid
-    marks = marks.after(marks[zi.valid(zi < nb)].store(zero).end(zj))
-    per = (topb + 1 + THREADS - 1) // THREADS
+    one, zero, past = _int(1), _int(0), _int(2**31 - 1)
+    lens = [_list_len(q_first + (grp * GROUP + i).minimum(rows - 1), kpool, topb) for i in range(GROUP)]
+    per = (L + 1 + THREADS - 1) // THREADS  # positions a thread takes in each list: they reach past every list's end
+    width = THREADS * per
+
+    # the lists, with `past` from each one's length to `width`
+    lst = UOp.alloc((GROUP, width), dtypes.int32, addrspace=AddrSpace.LOCAL)
+    loads = []
     for i in range(GROUP):
-        row = grp * GROUP + i
-        n_list = _list_len(q_first + row.minimum(rows - 1), kpool, topb)
-        stores = []
         for j in range(per):
             e = tid + j * THREADS
-            ok = e < n_list
-            blk = sel[bb, row, ok.where(e, 0)].load().cast(dtypes.weakint).maximum(0).minimum(nblk - 1)
-            stores.append(marks[blk.valid(ok)].store(marks[blk].load() | (1 << i)))
-        marks = marks.after(*stores)  # a row's blocks are distinct: no two threads of one pass share an entry
-    run = (nb + THREADS - 1) // THREADS
-    start = tid * run
-    cnt = _ireg((1,), 0)
-    a = UOp.range(run, 101)
-    idx = start + a
-    inside = idx < nb
-    present = inside & marks[inside.where(idx, 0)].load().ne(0)
-    cnt = cnt.after(cnt[0].store(cnt.after(a)[0].load() + present.where(one, zero)).end(a))
-    mine = cnt[0].load()
-    scan = UOp.alloc((2, THREADS), dtypes.int32, addrspace=AddrSpace.LOCAL)
-    buf = scan.after(scan[0, tid].store(mine))
+            ok = e < lens[i]
+            loads.append(lst[i, e].store(ok.where(sel[bb, grp * GROUP + i, ok.where(e, 0)].load(), past)))
+    lst = lst.after(*loads)
+    steps = [1 << b for b in range(L.bit_length() - 1, -1, -1)]
+
+    def below(j: int, v: UOp) -> UOp:
+        """How many entries of list j are less than v (its first L positions hold all of them)."""
+        pos = UOp.const(0, dtypes.weakint)
+        for step in steps:
+            at = pos + (step - 1)
+            ok = at < L
+            pos = (ok & (lst[j, ok.where(at, 0)].load() < v)).where(pos + step, pos)
+        return pos
+
+    # each thread a run of `per` positions of every list
+    start = tid * per
+    entries = []  # (list, position, block, owned, {other list: (entries below, holds it)})
+    counts = []
+    for i in range(GROUP):
+        owned_here = zero
+        for a in range(per):
+            k = start + a
+            v = lst[i, k].load()
+            others = {}
+            for j in range(GROUP):
+                if j != i:
+                    at = below(j, v)
+                    others[j] = (at, lst[j, at].load().eq(v))
+            owned = functools.reduce(lambda acc, j: acc & others[j][1].logical_not(), range(i), v < past)
+            entries.append((i, k, v, owned, others))
+            owned_here = owned_here + owned.where(one, zero)
+        counts.append(owned_here)
+
+    # owned entries before each thread's run, per list (inclusive Hillis-Steele scan, double-buffered)
+    scan = UOp.alloc((2, GROUP, THREADS), dtypes.int32, addrspace=AddrSpace.LOCAL)
+    buf = scan.after(*[scan[0, i, tid].store(counts[i]) for i in range(GROUP)])
     p, off = 0, 1
     while off < THREADS:
         prev, has = (tid - off).maximum(0), tid >= off
-        buf = scan.after(scan[1 - p, tid].store(buf[p, tid].load() + has.where(buf[p, prev].load(), zero)))
+        nxt = [buf[p, i, tid].load() + has.where(buf[p, i, prev].load(), zero) for i in range(GROUP)]
+        buf = scan.after(*[scan[1 - p, i, tid].store(nxt[i]) for i in range(GROUP)])
         p, off = 1 - p, off * 2
-    base = buf[p, tid].load() - mine
-    written = _ireg((1,), 0)
-    a2 = UOp.range(run, 102)
-    idx2 = start + a2
-    inside2 = idx2 < nb
-    mask = marks[inside2.where(idx2, 0)].load()
-    take = inside2 & mask.ne(0)
-    taken = written.after(a2)[0].load()
-    slot = (base + taken).cast(dtypes.weakint).valid(take)
-    write = UOp.group(
-        ulist[bb, grp, slot].store(idx2.cast(dtypes.int32)),
-        umask[bb, grp, slot].store(mask),
-        written[0].store(taken + take.where(one, zero)),
-    ).end(a2)
-    total = ulen[bb, grp, UOp.const(0, dtypes.weakint).valid(tid.eq(THREADS - 1))].store(buf[p, tid].load())
-    return UOp.group(write, total).end(tid, grp, bb).sink(arg=KernelInfo(name="qsa_union", opts_to_apply=()))
+
+    # owned_below[i, k]: the entries list i owns among its first k
+    owned_below = UOp.alloc((GROUP, width), dtypes.int32, addrspace=AddrSpace.LOCAL)
+    stores, before = [], []
+    for i in range(GROUP):
+        acc = buf[p, i, tid].load() - counts[i]
+        for a in range(per):
+            _, k, _, owned, _ = entries[i * per + a]
+            stores.append(owned_below[i, k].store(acc))
+            before.append(acc)
+            acc = acc + owned.where(one, zero)
+    owned_below = owned_below.after(*stores)
+
+    writes = []
+    for (i, _, v, _, others), mine in zip(entries, before, strict=True):
+        place = sum((owned_below[j, at].load() for j, (at, _) in others.items()), mine)
+        mark = sum((held.where(_int(1 << j), zero) for j, (_, held) in others.items()), _int(1 << i))
+        slot = place.cast(dtypes.weakint)
+        writes += [ulist[bb, grp, slot].store(v), umask[bb, grp, slot].store(mark)]
+        writes.append(ulen[bb, grp, v.eq(past).where(0, 1)].store(place))
+    return UOp.group(*writes).end(tid, grp, bb).sink(arg=KernelInfo(name="qsa_union", opts_to_apply=()))
 
 
 @functools.cache
@@ -700,31 +738,29 @@ def select(iq: Tensor, blk: Tensor, q_first: Any, rows: Any, kpool: int, topb: i
     return Tensor.custom_kernel(sel, _bound(scores, q_first, rows), fxn=fxn)[0]
 
 
+def union(sel: Tensor, q_first: Any, rows: Any, kpool: int, topb: int, blocks: int) -> tuple[Tensor, Tensor, Tensor]:
+    """For each group of GROUP rows of the lists `sel` (batch, padded rows, topb + 1): the union of the group's
+    lists, ascending, the rows that listed each entry (bit i for row i of the group), both (batch, groups, one more
+    than the at most GROUP * (topb + 1) or `blocks` entries of a union), and the union's length (batch, groups, 2:
+    the length, then a slot nothing reads), int32 (`_union`)."""
+    B, R, _ = sel.shape
+    most = min(GROUP * (topb + 1), blocks) + 1  # and the spare entry `_union` writes after the union
+    i32 = functools.partial(Tensor.empty, dtype=dtypes.int32, device=sel.device)
+    fxn = functools.partial(_union, q_first=q_first, rows=rows, kpool=kpool, topb=topb)
+    out = Tensor.custom_kernel(
+        i32(B, R // GROUP, most), i32(B, R // GROUP, most), i32(B, R // GROUP, 2), _bound(sel, q_first, rows), fxn=fxn
+    )
+    return out[0], out[1], out[2]
+
+
 def attend(q: Tensor, cache_kv: Tensor, sel: Tensor, q_first: Any, rows: Any, kpool: int, topb: int) -> Tensor:
     """Attention of `q` (B, H, padded rows, D) over the positions each row's list names in `cache_kv`
     (2, B, H_KV, N, D) half: (B, H, padded rows, D) float32."""
     B, H, R, D = q.shape
     H_KV = int(cache_kv.shape[2])
     group = H // H_KV
-    nblk = int(cache_kv.shape[3]) // kpool + 1
-    if (
-        GROUPED
-        and R >= GROUP_MIN_ROWS
-        and R % GROUP == 0
-        and (GROUP * group) % WMMA_M == 0
-        and nblk * 4 <= MARKS_BYTES
-        and not _is_rdna4(q.device)
-    ):
-        maxu = min(GROUP * (topb + 1), nblk)
-        i32 = functools.partial(Tensor.empty, dtype=dtypes.int32, device=q.device)
-        fxn = functools.partial(_union, q_first=q_first, rows=rows, kpool=kpool, topb=topb, nblk=nblk)
-        ulist, umask, ulen = Tensor.custom_kernel(
-            i32(B, R // GROUP, maxu),
-            i32(B, R // GROUP, maxu),
-            i32(B, R // GROUP, 1),
-            _bound(sel, q_first, rows),
-            fxn=fxn,
-        )[:3]
+    if GROUPED and R >= GROUP_MIN_ROWS and R % GROUP == 0 and (GROUP * group) % WMMA_M == 0 and not _is_rdna4(q.device):
+        ulist, umask, ulen = union(sel, q_first, rows, kpool, topb, int(cache_kv.shape[3]) // kpool + 1)
         qg = q.half().reshape(B, H_KV, group, R, D).permute(0, 1, 3, 2, 4).reshape(B * H_KV, R * group, D).contiguous()
         out = Tensor.empty(B, H, R, D, dtype=dtypes.float32, device=q.device)
         fxn = functools.partial(_attend_group, q_first=q_first, rows=rows, kpool=kpool, rdna4=False)
@@ -779,8 +815,9 @@ def _attention(block: Any, x: Tensor, start_pos: tuple[Any, ...]) -> Tensor:
     if cfg.qk_norm and cfg.qk_norm != cfg.head_dim:
         q, k = block.attn_q_norm(q), block.attn_k_norm(k)
     B, T, _ = x.shape
-    gate = None
+    gate = proj = None
     if cfg.attn_output_gate:
+        proj = q  # each head's query, then its output gate
         qg = q.reshape(B, T, cfg.n_heads, 2, cfg.head_dim)
         q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, cfg.n_heads * cfg.head_dim)
     q = q.reshape(B, T, cfg.n_heads, cfg.head_dim).transpose(1, 2)
@@ -808,10 +845,38 @@ def _attention(block: Any, x: Tensor, start_pos: tuple[Any, ...]) -> Tensor:
         iq, q = iq.pad_to((B, R, idx.n_heads, idx.head_dim)), q.pad_to((B, cfg.n_heads, R, cfg.head_dim))
     sel = select(iq.float().contiguous(), blk, pos, T, kpool, topb)
     attn = attend(q, assigned_kv, sel, pos, T, kpool, topb)
+    out = block.attn_output
+    # the output projection reads its activations by tile when it is a layer of the tiled kernel (gemm.py)
+    tiled = proj is not None and int(B) == 1 and cfg.head_dim % WARP_SIZE == 0
+    ggml_type = gemm.takes_blocked(out, T, x.device) if tiled else None
+    if ggml_type is not None and proj is not None:
+        shape = gemm.blocked_shape(T, cfg.n_heads * cfg.head_dim)
+        z = Tensor.empty(*shape, dtype=dtypes.half, device=x.device)
+        fxn = functools.partial(_gated_out_kernel, heads=cfg.n_heads, dim=cfg.head_dim, tile=shape[2])
+        z = Tensor.custom_kernel(z, attn, proj.float().reshape(T, -1), fxn=fxn)[0]
+        return gemm.blocked_linear(out, ggml_type, z, T).reshape(B, T, -1)
     if isinstance(T, UOp):
         attn = attn[:, :, :T]
     attn = attn.transpose(1, 2).reshape(B, T, -1)
-    return block.attn_output(attn if gate is None else attn * gate.sigmoid())
+    return out(attn if gate is None else attn * gate.sigmoid())
+
+
+@functools.cache
+def _gated_out_kernel(z: UOp, attn: UOp, proj: UOp, heads: int, dim: int, tile: int) -> UOp:
+    """The output projection's activations: every head's attention output times the sigmoid of its gate (the
+    second half of the head's query projection), in fp16 and laid out by tile (`gemm.blocked_shape`, `tile` rows a
+    block). One wave per token and head; each store is one 32-input piece of a row."""
+    tokens = int(proj.shape[0])
+    attn = attn.reshape(heads, tokens, dim)  # (1, heads, tokens, dim) float32, as the attention kernel wrote it
+    token, head = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(heads, 1, AxisType.GLOBAL)
+    lane = UOp.range(WARP_SIZE, -1, AxisType.WARP)
+    stores = []
+    for i in range(dim // WARP_SIZE):
+        c = lane + i * WARP_SIZE
+        value = attn[head, token, c].load() * proj[token, (head * 2 + 1) * dim + c].load().sigmoid()
+        place = z[token // tile, head * (dim // WARP_SIZE) + i, token % tile, lane]
+        stores.append(place.store(value.cast(dtypes.half)))
+    return UOp.group(*stores).end(lane, head, token).sink(arg=KernelInfo(name="qsa_gated_out", opts_to_apply=()))
 
 
 def install() -> None:
